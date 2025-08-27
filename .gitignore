@@ -1,0 +1,7 @@
+/target
+
+# lockfile should only be included for binaries, not libraries
+Cargo.lock
+
+.idea
+.DS_Store
