@@ -108,10 +108,38 @@ pub enum MoonbaseApiError {
     InvalidToken(#[from] jsonwebtoken::errors::Error),
 }
 
-/// Manages the product's license activation in a background thread,
-/// notifying the main thread about state changes via queue.
+/// Configuration options for the [LicenseActivator].
+#[derive(Clone)]
+pub struct LicenseActivationConfig {
+    /// The Moonbase vendor id for the store.
+    /// Used to determine the API endpoint, i.e.
+    /// https://{vendor_id}.moonbase.sh
+    pub vendor_id: String,
+    /// The Moonbase product id that a license needs to be valid for.
+    pub product_id: String,
+    /// The public key to verify the signed JWT payload.
+    pub jwt_pubkey: String,
+
+    /// The path where the cached license token payload is stored on disk.
+    pub cached_token_path: PathBuf,
+
+    /// User-friendly display name of the device the software is running on.
+    /// Reported to Moonbase when activating a license.
+    pub device_name: String,
+    /// The unique signature of the device the software is running on.
+    pub device_signature: String,
+
+    /// The age threshold beyond which the activator attempts to refresh online tokens.
+    /// Before this age, the token is accepted without attempting any further online validation.
+    pub online_token_refresh_threshold: TimeDelta,
+    /// The age threshold beyond which an online token is deemed
+    /// too old to trust and must be refreshed before being accepted.
+    pub online_token_expiration_threshold: TimeDelta,
+}
+
+/// Performs license activation.
 pub struct LicenseActivator {
-    ctx: ActivationContext,
+    cfg: LicenseActivationConfig,
 
     /// Receiver for the main thread to poll changes to the license activation state.
     ///
@@ -154,53 +182,39 @@ impl Drop for LicenseActivator {
 }
 
 impl LicenseActivator {
-    /// Creates a new license checker,
+    /// Creates a new license activator,
     /// spawning the background threads that perform license checking.
-    pub fn new(
-        cached_token_path: PathBuf,
-        vendor_id: String,
-        product_id: String,
-        jwt_pubkey: String,
-
-        device_signature: String,
-        device_name: String,
-
-        online_token_refresh_threshold: TimeDelta,
-        online_token_expiration_threshold: TimeDelta,
-    ) -> Self {
+    ///
+    /// These background threads run until activation is successful
+    /// or the [LicenseActivator] is dropped.
+    pub fn spawn(cfg: LicenseActivationConfig) -> Self {
         // create communication channels to report activation state changes to calling thread
         let (state_send, state_recv) = std::sync::mpsc::channel();
         let (error_send, error_recv) = std::sync::mpsc::channel();
 
-        let poll_online_activation = Arc::new(AtomicBool::new(false));
-
-        let ctx = ActivationContext {
-            vendor_id,
-            product_id,
-            jwt_pubkey: jwt_pubkey.clone(),
-            cached_token_path,
-
-            device_name,
-            device_signature,
-
-            online_token_refresh_threshold,
-            online_token_expiration_threshold,
-
-            poll_online_activation: poll_online_activation.clone(),
-        };
-
         // spawn worker thread
         let running = Arc::new(AtomicBool::new(true));
         let running_clone = running.clone();
+
+        let poll_online_activation = Arc::new(AtomicBool::new(false));
+        let poll_online_activation_clone = poll_online_activation.clone();
+
         let state_send_clone = state_send.clone();
         let error_send_clone = error_send.clone();
-        let ctx_clone = ctx.clone();
+        let cfg_clone = cfg.clone();
+
         let join = thread::spawn(|| {
-            worker_thread(running_clone, state_send_clone, error_send_clone, ctx_clone);
+            worker_thread(
+                running_clone,
+                state_send_clone,
+                error_send_clone,
+                poll_online_activation_clone,
+                cfg_clone,
+            );
         });
 
         Self {
-            ctx,
+            cfg,
 
             state_recv,
             state_send,
@@ -218,9 +232,9 @@ impl LicenseActivator {
     /// Creates and returns the contents to write to the machine file used for offline activation.
     pub fn machine_file_contents(&self) -> String {
         DeviceToken::new(
-            self.ctx.device_signature.clone(),
-            self.ctx.device_name.clone(),
-            self.ctx.product_id.clone(),
+            self.cfg.device_signature.clone(),
+            self.cfg.device_name.clone(),
+            self.cfg.product_id.clone(),
         )
         .serialize()
     }
@@ -239,7 +253,7 @@ impl LicenseActivator {
                 self.running.store(false, Ordering::Relaxed);
 
                 // persist the token on disk
-                if let Err(e) = fs::write(&self.ctx.cached_token_path, token) {
+                if let Err(e) = fs::write(&self.cfg.cached_token_path, token) {
                     _ = self.error_send.send(ActivationError::SaveCachedToken(e));
                 }
             }
@@ -251,51 +265,19 @@ impl LicenseActivator {
         &mut self,
         token: &String,
     ) -> Result<LicenseTokenClaims, OfflineTokenValidationError> {
-        let claims = parse_token(&self.ctx, token)?;
+        let claims = parse_token(&self.cfg, token)?;
 
         if claims.method != ActivationMethod::Offline {
             return Err(OfflineTokenValidationError::NoOfflineToken);
         }
 
-        validate_token_applicable(&self.ctx, &claims)?;
+        validate_token_applicable(&self.cfg, &claims)?;
 
         Ok(claims)
     }
 }
 
-/// All data required by the background thread to perform license validation.
-#[derive(Clone)]
-struct ActivationContext {
-    /// The Moonbase vendor id for the store.
-    /// Used to determine the API endpoint, i.e.
-    /// https://{vendor_id}.moonbase.sh
-    vendor_id: String,
-    /// The Moonbase product id that a license needs to be valid for.
-    product_id: String,
-    /// The public key to verify the signed JWT payload.
-    jwt_pubkey: String,
-
-    /// The path where the cached license token payload is stored on disk.
-    cached_token_path: PathBuf,
-
-    /// User-friendly display name of the device the software is running on.
-    /// Reported to Moonbase when activating a license.
-    device_name: String,
-    /// The unique signature of the device the software is running on.
-    device_signature: String,
-
-    /// The age threshold beyond which the activator attempts to refresh online tokens.
-    /// Before this age, the token is accepted without attempting any further online validation.
-    online_token_refresh_threshold: TimeDelta,
-    /// The age threshold beyond which an online token is deemed
-    /// too old to trust and must be refreshed before being accepted.
-    online_token_expiration_threshold: TimeDelta,
-
-    /// Whether to poll for online validation results.
-    poll_online_activation: Arc<AtomicBool>,
-}
-
-impl ActivationContext {
+impl LicenseActivationConfig {
     /// Returns the base URL to make any Moonbase API requests to.
     fn moonbase_api_base_url(&self) -> String {
         format!("https://{}.moonbase.sh", self.vendor_id)
@@ -306,16 +288,17 @@ fn worker_thread(
     running: Arc<AtomicBool>,
     state_send: Sender<ActivationState>,
     error_send: Sender<ActivationError>,
-    ctx: ActivationContext,
+    poll_online_activation: Arc<AtomicBool>,
+    cfg: LicenseActivationConfig,
 ) {
     // first, try to load a cached license token from disk
-    match check_cached_token(&ctx, running.clone()) {
+    match check_cached_token(&cfg, running.clone()) {
         Ok(Some(result)) => {
             _ = state_send.send(ActivationState::Activated(result.claims));
 
             if let Some(token) = result.new_token {
                 // persist the new token on disk
-                if let Err(e) = fs::write(&ctx.cached_token_path, token) {
+                if let Err(e) = fs::write(&cfg.cached_token_path, token) {
                     _ = error_send.send(ActivationError::SaveCachedToken(e));
                 }
             }
@@ -339,7 +322,7 @@ fn worker_thread(
     _ = state_send.send(ActivationState::NeedsActivation(None));
 
     // ask Moonbase for the endpoints to perform online activation
-    let activation_urls = match (|| moonbase_request_online_activation(&ctx))
+    let activation_urls = match (|| moonbase_request_online_activation(&cfg))
         .retry(
             &ExponentialBuilder::default()
                 .with_max_delay(Duration::from_secs(10))
@@ -370,17 +353,17 @@ fn worker_thread(
         sleep(Duration::from_secs(5));
 
         match activation_urls.as_ref() {
-            Some(activation_urls) if ctx.poll_online_activation.load(Ordering::Relaxed) => {
+            Some(activation_urls) if poll_online_activation.load(Ordering::Relaxed) => {
                 // the user is attempting online activation -
                 // check if they have succeeded
 
-                match moonbase_check_online_activation(&ctx, &activation_urls.request) {
+                match moonbase_check_online_activation(&cfg, &activation_urls.request) {
                     Ok(TokenValidationResponse::Valid(token, claims)) => {
                         // the software has been activated!
                         _ = state_send.send(ActivationState::Activated(claims));
 
                         // persist the token on disk
-                        if let Err(e) = fs::write(&ctx.cached_token_path, token) {
+                        if let Err(e) = fs::write(&cfg.cached_token_path, token) {
                             _ = error_send.send(ActivationError::SaveCachedToken(e));
                         }
 
@@ -397,12 +380,12 @@ fn worker_thread(
             _ => {
                 // if the user isn't currently attempting to activate the plugin in this plugin instance,
                 // check if another instance of the software has activated the plugin in the meantime
-                if let Ok(Some(result)) = check_cached_token(&ctx, running.clone()) {
+                if let Ok(Some(result)) = check_cached_token(&cfg, running.clone()) {
                     _ = state_send.send(ActivationState::Activated(result.claims));
 
                     if let Some(token) = result.new_token {
                         // persist the new token on disk
-                        if let Err(e) = fs::write(&ctx.cached_token_path, token) {
+                        if let Err(e) = fs::write(&cfg.cached_token_path, token) {
                             _ = error_send.send(ActivationError::SaveCachedToken(e));
                         }
                     }
@@ -429,10 +412,10 @@ struct CachedTokenCheckResult {
 ///
 /// None is returned if no cached token exists.
 fn check_cached_token(
-    ctx: &ActivationContext,
+    cfg: &LicenseActivationConfig,
     running: Arc<AtomicBool>,
 ) -> Result<Option<CachedTokenCheckResult>, CachedTokenError> {
-    match load_cached_token(ctx) {
+    match load_cached_token(cfg) {
         Ok(Some((token, claims))) => {
             match claims.method {
                 ActivationMethod::Offline => {
@@ -450,7 +433,7 @@ fn check_cached_token(
 
                     let token_validation_age_days = Utc::now() - claims.last_validated;
 
-                    if token_validation_age_days < ctx.online_token_refresh_threshold {
+                    if token_validation_age_days < cfg.online_token_refresh_threshold {
                         // if the token was last validated very recently,
                         // we just accept it and don't even attempt to refresh and validate it.
                         // this minimizes API requests and waiting time for the user.
@@ -461,7 +444,7 @@ fn check_cached_token(
                     }
 
                     // try to validate and refresh the token
-                    match (|| moonbase_refresh_token(ctx, &token))
+                    match (|| moonbase_refresh_token(cfg, &token))
                         .retry(
                             &ExponentialBuilder::default()
                                 .with_max_delay(Duration::from_secs(5))
@@ -484,7 +467,7 @@ fn check_cached_token(
                         Err(e) => {
                             // the cached token couldn't be validated.
 
-                            if token_validation_age_days < ctx.online_token_expiration_threshold {
+                            if token_validation_age_days < cfg.online_token_expiration_threshold {
                                 // if the token was validated somewhat recently,
                                 // we give the user the benefit of the doubt
                                 // and allow them to use the token without refreshing.
@@ -512,19 +495,19 @@ fn check_cached_token(
 /// the caller should still check the `last_validated` field
 /// and validate online if necessary.
 fn load_cached_token(
-    ctx: &ActivationContext,
+    cfg: &LicenseActivationConfig,
 ) -> Result<Option<(String, LicenseTokenClaims)>, CachedTokenError> {
-    if !fs::exists(&ctx.cached_token_path)? {
+    if !fs::exists(&cfg.cached_token_path)? {
         return Ok(None);
     }
 
-    let token = fs::read_to_string(&ctx.cached_token_path)?;
+    let token = fs::read_to_string(&cfg.cached_token_path)?;
 
     // parse and validate the token
-    let claims = parse_token(ctx, &token)?;
+    let claims = parse_token(cfg, &token)?;
 
     // ensure the token applies to this product and device
-    validate_token_applicable(ctx, &claims)?;
+    validate_token_applicable(cfg, &claims)?;
 
     Ok(Some((token, claims)))
 }
@@ -535,11 +518,11 @@ fn load_cached_token(
 /// applies to the current hardware and product,
 /// only whether it's a well-formed token.
 fn parse_token(
-    ctx: &ActivationContext,
+    cfg: &LicenseActivationConfig,
     token: &String,
 ) -> Result<LicenseTokenClaims, jsonwebtoken::errors::Error> {
     let mut validation = Validation::new(Algorithm::RS256);
-    validation.set_audience(&[&ctx.product_id]);
+    validation.set_audience(&[&cfg.product_id]);
 
     // disable validation of expiry as it's not always given
     validation.required_spec_claims.clear();
@@ -547,7 +530,7 @@ fn parse_token(
 
     let claims = jsonwebtoken::decode::<LicenseTokenClaims>(
         token.as_str(),
-        &DecodingKey::from_rsa_pem(ctx.jwt_pubkey.as_bytes()).unwrap(),
+        &DecodingKey::from_rsa_pem(cfg.jwt_pubkey.as_bytes()).unwrap(),
         &validation,
     )?
     .claims;
@@ -565,10 +548,10 @@ fn parse_token(
 }
 
 fn validate_token_applicable(
-    ctx: &ActivationContext,
+    cfg: &LicenseActivationConfig,
     claims: &LicenseTokenClaims,
 ) -> Result<(), InapplicableTokenError> {
-    if claims.device_signature != ctx.device_signature {
+    if claims.device_signature != cfg.device_signature {
         return Err(InapplicableTokenError::InvalidDeviceSignature);
     }
 
@@ -585,13 +568,13 @@ enum TokenValidationResponse {
 /// Asks the Moonbase API whether the given license token is still valid.
 /// If it is, a new token with updated `last_updated` property is returned.
 fn moonbase_refresh_token(
-    ctx: &ActivationContext,
+    cfg: &LicenseActivationConfig,
     token: &String,
 ) -> Result<TokenValidationResponse, MoonbaseApiError> {
     let response = ureq::post(format!(
         "{}/api/client/licenses/{}/validate",
-        ctx.moonbase_api_base_url(),
-        ctx.product_id
+        cfg.moonbase_api_base_url(),
+        cfg.product_id
     ))
     .config()
     .timeout_global(Some(Duration::from_secs(10)))
@@ -607,7 +590,7 @@ fn moonbase_refresh_token(
         let token = response.into_body().read_to_string()?;
 
         // parse the refreshed token
-        return match parse_token(ctx, &token) {
+        return match parse_token(cfg, &token) {
             Ok(claims) => Ok(TokenValidationResponse::Valid(token, claims)),
             Err(_) => Err(MoonbaseApiError::UnexpectedResponse(status, token)),
         };
@@ -650,19 +633,19 @@ struct ActivationUrls {
 
 /// Asks the Moonbase API for the URLs to perform online activation.
 fn moonbase_request_online_activation(
-    ctx: &ActivationContext,
+    cfg: &LicenseActivationConfig,
 ) -> Result<ActivationUrls, MoonbaseApiError> {
     let response = ureq::post(format!(
         "{}/api/client/activations/{}/request",
-        ctx.moonbase_api_base_url(),
-        ctx.product_id
+        cfg.moonbase_api_base_url(),
+        cfg.product_id
     ))
     .config()
     .timeout_global(Some(Duration::from_secs(10)))
     .build()
     .send_json(ActivationUrlsRequestPayload {
-        device_name: ctx.device_name.clone(),
-        device_signature: ctx.device_signature.clone(),
+        device_name: cfg.device_name.clone(),
+        device_signature: cfg.device_signature.clone(),
     })?;
 
     let status = response.status();
@@ -693,7 +676,7 @@ fn moonbase_request_online_activation(
 /// Polls the given Moonbase activation URL to check if the user
 /// has activated their software using online activation.
 fn moonbase_check_online_activation(
-    ctx: &ActivationContext,
+    cfg: &LicenseActivationConfig,
     url: &String,
 ) -> Result<TokenValidationResponse, MoonbaseApiError> {
     let response = ureq::get(url)
@@ -715,7 +698,7 @@ fn moonbase_check_online_activation(
         let token = response.into_body().read_to_string()?;
 
         // parse the token
-        let claims = parse_token(ctx, &token)?;
+        let claims = parse_token(cfg, &token)?;
         return Ok(TokenValidationResponse::Valid(token, claims));
     }
 
