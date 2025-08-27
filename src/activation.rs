@@ -1,7 +1,7 @@
 use crate::claims::{ActivationMethod, LicenseTokenClaims};
 use crate::device_token::DeviceToken;
 use backon::{BlockingRetryable, ExponentialBuilder};
-use chrono::{TimeDelta, Utc};
+use chrono::Utc;
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{get_current_timestamp, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
@@ -131,10 +131,10 @@ pub struct LicenseActivationConfig {
 
     /// The age threshold beyond which the activator attempts to refresh online tokens.
     /// Before this age, the token is accepted without attempting any further online validation.
-    pub online_token_refresh_threshold: TimeDelta,
+    pub online_token_refresh_threshold: Duration,
     /// The age threshold beyond which an online token is deemed
     /// too old to trust and must be refreshed before being accepted.
-    pub online_token_expiration_threshold: TimeDelta,
+    pub online_token_expiration_threshold: Duration,
 }
 
 /// Performs license activation.
@@ -431,16 +431,24 @@ fn check_cached_token(
                     // it's an online activated token,
                     // so we should check if it's still valid
 
-                    let token_validation_age_days = Utc::now() - claims.last_validated;
+                    let token_validation_age = Utc::now() - claims.last_validated;
 
-                    if token_validation_age_days < cfg.online_token_refresh_threshold {
-                        // if the token was last validated very recently,
-                        // we just accept it and don't even attempt to refresh and validate it.
-                        // this minimizes API requests and waiting time for the user.
-                        return Ok(Some(CachedTokenCheckResult {
-                            claims,
-                            new_token: None,
-                        }));
+                    // Convert validation age to Duration.
+                    // If last_validated lies in the future from the perspective
+                    // of the machine running this code (conversion returns Error),
+                    // we can't trust the token and require re-validation.
+                    let token_validation_age = token_validation_age.to_std().ok();
+
+                    if let Some(token_validation_age) = token_validation_age {
+                        if token_validation_age < cfg.online_token_refresh_threshold {
+                            // if the token was last validated very recently,
+                            // we just accept it and don't even attempt to refresh and validate it.
+                            // this minimizes API requests and waiting time for the user.
+                            return Ok(Some(CachedTokenCheckResult {
+                                claims,
+                                new_token: None,
+                            }));
+                        }
                     }
 
                     // try to validate and refresh the token
@@ -467,14 +475,16 @@ fn check_cached_token(
                         Err(e) => {
                             // the cached token couldn't be validated.
 
-                            if token_validation_age_days < cfg.online_token_expiration_threshold {
-                                // if the token was validated somewhat recently,
-                                // we give the user the benefit of the doubt
-                                // and allow them to use the token without refreshing.
-                                return Ok(Some(CachedTokenCheckResult {
-                                    claims,
-                                    new_token: None,
-                                }));
+                            if let Some(token_validation_age) = token_validation_age {
+                                if token_validation_age < cfg.online_token_expiration_threshold {
+                                    // if the token was validated somewhat recently,
+                                    // we give the user the benefit of the doubt
+                                    // and allow them to use the token without refreshing.
+                                    return Ok(Some(CachedTokenCheckResult {
+                                        claims,
+                                        new_token: None,
+                                    }));
+                                }
                             }
 
                             Err(e.into())
