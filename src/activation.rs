@@ -4,7 +4,6 @@ use backon::{BlockingRetryable, ExponentialBuilder};
 use chrono::{TimeDelta, Utc};
 use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{get_current_timestamp, Algorithm, DecodingKey, Validation};
-use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -241,7 +240,6 @@ impl LicenseActivator {
 
                 // persist the token on disk
                 if let Err(e) = fs::write(&self.ctx.cached_token_path, token) {
-                    error!("Error writing offline license token to disk: {e}");
                     _ = self.error_send.send(ActivationError::SaveCachedToken(e));
                 }
             }
@@ -313,13 +311,11 @@ fn worker_thread(
     // first, try to load a cached license token from disk
     match check_cached_token(&ctx, running.clone()) {
         Ok(Some(result)) => {
-            info!("Found a valid local license token!");
             _ = state_send.send(ActivationState::Activated(result.claims));
 
             if let Some(token) = result.new_token {
                 // persist the new token on disk
                 if let Err(e) = fs::write(&ctx.cached_token_path, token) {
-                    error!("Error writing license token to disk: {e}");
                     _ = error_send.send(ActivationError::SaveCachedToken(e));
                 }
             }
@@ -331,7 +327,6 @@ fn worker_thread(
         }
         Err(e) => {
             // cached token couldn't be validated
-            info!("Error validating local license token: {e}");
             _ = error_send.send(ActivationError::LoadCachedToken(e));
         }
     }
@@ -356,7 +351,6 @@ fn worker_thread(
         Ok(activation_urls) => Some(activation_urls),
         Err(e) => {
             // we couldn't get an online activation URL from Moonbase after several tries
-            error!("Unable to get license activation URLs: {e}");
             _ = error_send.send(ActivationError::FetchActivationUrl(e));
             None
         }
@@ -365,7 +359,6 @@ fn worker_thread(
     if let Some(activation_urls) = activation_urls.as_ref() {
         // we got the URLs for online activation
         // send the user-facing activation URL to the main thread
-        info!("Obtained license activation URLs");
         _ = state_send.send(ActivationState::NeedsActivation(Some(
             activation_urls.browser.clone(),
         )));
@@ -384,12 +377,10 @@ fn worker_thread(
                 match moonbase_check_online_activation(&ctx, &activation_urls.request) {
                     Ok(TokenValidationResponse::Valid(token, claims)) => {
                         // the software has been activated!
-                        info!("License has been activated online!");
                         _ = state_send.send(ActivationState::Activated(claims));
 
                         // persist the token on disk
                         if let Err(e) = fs::write(&ctx.cached_token_path, token) {
-                            error!("Error writing license token to disk: {e}");
                             _ = error_send.send(ActivationError::SaveCachedToken(e));
                         }
 
@@ -399,7 +390,6 @@ fn worker_thread(
                         // the token hasn't yet been activated - simply try again
                     }
                     Err(e) => {
-                        error!("Error fetching activation state from Moonbase: {e}");
                         _ = error_send.send(ActivationError::FetchActivationState(e));
                     }
                 }
@@ -408,13 +398,11 @@ fn worker_thread(
                 // if the user isn't currently attempting to activate the plugin in this plugin instance,
                 // check if another instance of the software has activated the plugin in the meantime
                 if let Ok(Some(result)) = check_cached_token(&ctx, running.clone()) {
-                    info!("Found a valid local license token!");
                     _ = state_send.send(ActivationState::Activated(result.claims));
 
                     if let Some(token) = result.new_token {
                         // persist the new token on disk
                         if let Err(e) = fs::write(&ctx.cached_token_path, token) {
-                            error!("Error writing license token to disk: {e}");
                             _ = error_send.send(ActivationError::SaveCachedToken(e));
                         }
                     }
@@ -460,7 +448,7 @@ fn check_cached_token(
                     // it's an online activated token,
                     // so we should check if it's still valid
 
-                    let token_validation_age_days = (Utc::now() - claims.last_validated);
+                    let token_validation_age_days = Utc::now() - claims.last_validated;
 
                     if token_validation_age_days < ctx.online_token_refresh_threshold {
                         // if the token was last validated very recently,

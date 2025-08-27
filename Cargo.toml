@@ -9,7 +9,6 @@ backon = "1.5.2"
 base64 = "0.22.1"
 chrono = { version = "0.4.41", features = ["serde"] }
 jsonwebtoken = "9.3.1"
-log = "0.4.27"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
 thiserror = "2.0.16"
