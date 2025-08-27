@@ -461,7 +461,7 @@ fn check_cached_token(
                     }
 
                     // try to validate and refresh the token
-                    match (|| moonbase_refresh_token(&ctx, &token))
+                    match (|| moonbase_refresh_token(ctx, &token))
                         .retry(
                             &ExponentialBuilder::default()
                                 .with_max_delay(Duration::from_secs(5))
@@ -547,7 +547,7 @@ fn parse_token(
 
     let claims = jsonwebtoken::decode::<LicenseTokenClaims>(
         token.as_str(),
-        &DecodingKey::from_rsa_pem(&ctx.jwt_pubkey.as_bytes()).unwrap(),
+        &DecodingKey::from_rsa_pem(ctx.jwt_pubkey.as_bytes()).unwrap(),
         &validation,
     )?
     .claims;
@@ -607,7 +607,7 @@ fn moonbase_refresh_token(
         let token = response.into_body().read_to_string()?;
 
         // parse the refreshed token
-        return match parse_token(&ctx, &token) {
+        return match parse_token(ctx, &token) {
             Ok(claims) => Ok(TokenValidationResponse::Valid(token, claims)),
             Err(_) => Err(MoonbaseApiError::UnexpectedResponse(status, token)),
         };
@@ -715,7 +715,7 @@ fn moonbase_check_online_activation(
         let token = response.into_body().read_to_string()?;
 
         // parse the token
-        let claims = parse_token(&ctx, &token)?;
+        let claims = parse_token(ctx, &token)?;
         return Ok(TokenValidationResponse::Valid(token, claims));
     }
 
