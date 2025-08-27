@@ -82,3 +82,57 @@ Sensible default values are 1 and 20 days, respectively.
 
 Tokens created via **Offline** activation cannot be revoked,
 and are therefore valid forever unless the machine's device signature changes.
+
+## Flow
+
+Here's a rough overview of the `LicenseActivator`'s logic:
+
+```mermaid
+---
+config:
+  layout: dagre
+---
+flowchart TD
+ subgraph CacheFlow["Cached Token Flow"]
+        C{"Cached token exists?"}
+        V{"Younger than refresh threshold?"}
+        Activated1["Activated (from cache)"]
+        R{"Refresh successful?"}
+        Activated2["Activated (refreshed)"]
+        NeedsAct["Needs Activation"]
+  end
+ subgraph OfflineFlow["Offline Activation"]
+        Offline["User provides offline token"]
+        Activated3["Activated (offline)"]
+        Err1["Error: Offline token invalid"]
+  end
+ subgraph OnlineFlow["Online Activation"]
+        Online["Request online activation URL"]
+        URL["User opens browser"]
+        Poll{"Token active online?"}
+        Activated4["Activated (online)"]
+        Wait["Keep polling..."]
+  end
+    C -- Yes --> V
+    V -- Yes --> Activated1
+    V -- No --> R
+    R -- Yes --> Activated2
+    R -- No --> NeedsAct
+    C -- No --> NeedsAct
+    NeedsAct --> Offline & Online
+    Offline -- Valid --> Activated3
+    Offline -- Invalid --> Err1
+    Online --> URL
+    URL --> Poll
+    Poll -- Yes --> Activated4
+    Poll -- No --> Wait
+    Wait --> Poll
+    Start(["Start Activation"]) --> C
+     Activated1:::state
+     Activated2:::state
+     Activated3:::state
+     Err1:::err
+     Activated4:::state
+    classDef state fill:#eef,stroke:#88f,color:#003
+    classDef err fill:#fee,stroke:#f88,color:#700
+```
