@@ -1,4 +1,6 @@
 # moonbase-licensing
+[![Crates.io](https://img.shields.io/crates/v/moonbase-licensing.svg)](https://crates.io/crates/moonbase-licensing)
+[![Docs.rs](https://img.shields.io/docsrs/moonbase-licensing)](https://docs.rs/moonbase-licensing)
 
 Rust client for the [Moonbase](https://moonbase.sh) licensing system,
 supporting both online and offline activation flows.
