@@ -169,7 +169,7 @@ fn handle_activation_options(url: &str, activator: &mut LicenseActivator) -> Res
                 );
                 spinner.enable_steady_tick(Duration::from_millis(100));
 
-                activator.submit_offline_activation_token(&token.trim().to_string());
+                activator.submit_offline_activation_token(token.trim());
 
                 std::thread::sleep(Duration::from_millis(500));
                 spinner.finish_and_clear();
@@ -270,7 +270,7 @@ fn get_env_or_prompt(env_var: &str, prompt: &str) -> Result<String> {
                 .interact_text()
                 .map_err(|e| env::VarError::NotUnicode(e.to_string().into()))
         })
-        .context(format!("{} is required", prompt))
+        .context(format!("{prompt} is required"))
 }
 
 /// Retrieves JWT public key from environment or user input.

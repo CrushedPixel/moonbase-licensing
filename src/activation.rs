@@ -244,7 +244,7 @@ impl LicenseActivator {
     ///
     /// The result of the validation can be obtained
     /// from the state and error receivers as usual.
-    pub fn submit_offline_activation_token(&mut self, token: &String) {
+    pub fn submit_offline_activation_token(&mut self, token: &str) {
         match self.check_offline_activation_token(token) {
             Ok(claims) => {
                 _ = self.state_send.send(ActivationState::Activated(claims));
@@ -263,7 +263,7 @@ impl LicenseActivator {
 
     fn check_offline_activation_token(
         &mut self,
-        token: &String,
+        token: &str,
     ) -> Result<LicenseTokenClaims, OfflineTokenValidationError> {
         let claims = parse_token(&self.cfg, token)?;
 
@@ -529,7 +529,7 @@ fn load_cached_token(
 /// only whether it's a well-formed token.
 fn parse_token(
     cfg: &LicenseActivationConfig,
-    token: &String,
+    token: &str,
 ) -> Result<LicenseTokenClaims, jsonwebtoken::errors::Error> {
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_audience(&[&cfg.product_id]);
@@ -539,7 +539,7 @@ fn parse_token(
     validation.validate_exp = false;
 
     let claims = jsonwebtoken::decode::<LicenseTokenClaims>(
-        token.as_str(),
+        token,
         &DecodingKey::from_rsa_pem(cfg.jwt_pubkey.as_bytes()).unwrap(),
         &validation,
     )?
@@ -579,7 +579,7 @@ enum TokenValidationResponse {
 /// If it is, a new token with updated `last_updated` property is returned.
 fn moonbase_refresh_token(
     cfg: &LicenseActivationConfig,
-    token: &String,
+    token: &str,
 ) -> Result<TokenValidationResponse, MoonbaseApiError> {
     let response = ureq::post(format!(
         "{}/api/client/licenses/{}/validate",
@@ -687,7 +687,7 @@ fn moonbase_request_online_activation(
 /// has activated their software using online activation.
 fn moonbase_check_online_activation(
     cfg: &LicenseActivationConfig,
-    url: &String,
+    url: &str,
 ) -> Result<TokenValidationResponse, MoonbaseApiError> {
     let response = ureq::get(url)
         .config()
