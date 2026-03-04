@@ -77,9 +77,9 @@ pub enum CachedTokenError {
     #[error("inapplicable token: {0}")]
     Inapplicable(#[from] InapplicableTokenError),
 
-    /// The token has been marked as revoked by Moonbase.
-    #[error("token has been revoked")]
-    Revoked,
+    /// Online validation by Moonbase failed.
+    #[error("online validation failed: {1}")]
+    ValidationFailed(ValidationFailedType, String),
 
     /// The token is valid, but too old to trust,
     /// and it couldn't be refreshed.
@@ -106,6 +106,18 @@ pub enum MoonbaseApiError {
     /// The token returned by the Moonbase API was malformed.
     #[error("invalid token: {0}")]
     InvalidToken(#[from] jsonwebtoken::errors::Error),
+}
+
+/// The reason why online license validation failed.
+#[derive(Debug)]
+pub enum ValidationFailedType {
+    LicenseRevoked,
+    LicenseActivationRevoked,
+    LicenseExpired,
+    NoEligibleLicense,
+    /// Unknown error type in Moonbase API response -
+    /// if this is reached, this library needs updating!
+    Unknown,
 }
 
 /// Configuration options for the [LicenseActivator].
@@ -358,7 +370,7 @@ fn worker_thread(
                 // check if they have succeeded
 
                 match moonbase_check_online_activation(&cfg, &activation_urls.request) {
-                    Ok(TokenValidationResponse::Valid(token, claims)) => {
+                    Ok(Some((token, claims))) => {
                         // the software has been activated!
                         _ = state_send.send(ActivationState::Activated(claims));
 
@@ -369,8 +381,8 @@ fn worker_thread(
 
                         return;
                     }
-                    Ok(TokenValidationResponse::Invalid) => {
-                        // the token hasn't yet been activated - simply try again
+                    Ok(None) => {
+                        // not yet activated - simply try again
                     }
                     Err(e) => {
                         _ = error_send.send(ActivationError::FetchActivationState(e));
@@ -468,9 +480,8 @@ fn check_cached_token(
                                 new_token: Some(new_token),
                             }))
                         }
-                        Ok(TokenValidationResponse::Invalid) => {
-                            // Moonbase has revoked the token!
-                            Err(CachedTokenError::Revoked)
+                        Ok(TokenValidationResponse::ValidationFailed(failure_type, detail)) => {
+                            Err(CachedTokenError::ValidationFailed(failure_type, detail))
                         }
                         Err(e) => {
                             // the cached token couldn't be validated.
@@ -571,8 +582,8 @@ fn validate_token_applicable(
 enum TokenValidationResponse {
     /// The token is valid and a refreshed token is provided.
     Valid(String, LicenseTokenClaims),
-    /// The token is invalid.
-    Invalid,
+    /// Online validation failed with a specific reason.
+    ValidationFailed(ValidationFailedType, String),
 }
 
 /// Asks the Moonbase API whether the given license token is still valid.
@@ -609,7 +620,22 @@ fn moonbase_refresh_token(
 
     // Moonbase responds with 400 Bad Request if the license is not valid anymore
     if status == StatusCode::BAD_REQUEST {
-        return Ok(TokenValidationResponse::Invalid);
+        // error responses use the standard problem details format:
+        // https://www.rfc-editor.org/rfc/rfc9457.html
+        let body = response.into_body().read_to_string()?;
+        let problem: ProblemDetails = serde_json::from_str(&body)
+            .map_err(|_| MoonbaseApiError::UnexpectedResponse(status, body.clone()))?;
+        let failure_type = match problem.error_type.as_str() {
+            "LicenseRevoked" => ValidationFailedType::LicenseRevoked,
+            "LicenseActivationRevoked" => ValidationFailedType::LicenseActivationRevoked,
+            "LicenseExpired" => ValidationFailedType::LicenseExpired,
+            "NoEligibleLicense" => ValidationFailedType::NoEligibleLicense,
+            _ => ValidationFailedType::Unknown,
+        };
+        return Ok(TokenValidationResponse::ValidationFailed(
+            failure_type,
+            problem.detail,
+        ));
     }
 
     // Moonbase responded with a status code that we don't expect.
@@ -622,6 +648,13 @@ fn moonbase_refresh_token(
             // as reporting the actual status code error is more important
             .unwrap_or("".to_string()),
     ))
+}
+
+#[derive(Deserialize)]
+struct ProblemDetails {
+    #[serde(rename = "errorType")]
+    error_type: String,
+    detail: String,
 }
 
 #[derive(Serialize)]
@@ -686,10 +719,12 @@ fn moonbase_request_online_activation(
 
 /// Polls the given Moonbase activation URL to check if the user
 /// has activated their software using online activation.
+///
+/// Returns `None` if the product has not yet been activated.
 fn moonbase_check_online_activation(
     cfg: &LicenseActivationConfig,
     url: &str,
-) -> Result<TokenValidationResponse, MoonbaseApiError> {
+) -> Result<Option<(String, LicenseTokenClaims)>, MoonbaseApiError> {
     let response = ureq::get(url)
         .config()
         .timeout_global(Some(Duration::from_secs(10)))
@@ -700,7 +735,7 @@ fn moonbase_check_online_activation(
 
     if status == StatusCode::NO_CONTENT {
         // the product has not yet been activated.
-        return Ok(TokenValidationResponse::Invalid);
+        return Ok(None);
     }
 
     if status == StatusCode::OK {
@@ -710,7 +745,7 @@ fn moonbase_check_online_activation(
 
         // parse the token
         let claims = parse_token(cfg, &token)?;
-        return Ok(TokenValidationResponse::Valid(token, claims));
+        return Ok(Some((token, claims)));
     }
 
     // Moonbase responded with a status code that we don't expect.
