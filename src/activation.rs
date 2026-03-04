@@ -587,6 +587,7 @@ fn moonbase_refresh_token(
         cfg.product_id
     ))
     .config()
+    .http_status_as_error(false)
     .timeout_global(Some(Duration::from_secs(10)))
     .build()
     .content_type("text/plain")
