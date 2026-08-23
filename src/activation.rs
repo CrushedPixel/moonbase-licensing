@@ -36,7 +36,7 @@ pub enum ActivationState {
         ///
         /// May be None temporarily for trials as well
         /// while fetching from the Moonbase API.
-        online_activation_url: Option<String>,
+        followup_online_activation_url: Option<String>,
     },
 }
 
@@ -295,7 +295,7 @@ impl LicenseActivator {
             if matches!(
                 &state,
                 ActivationState::Activated {
-                    online_activation_url: None,
+                    followup_online_activation_url: None,
                     ..
                 }
             ) {
@@ -445,7 +445,7 @@ fn worker_thread(
                     _ = state_send.send((
                         ActivationState::Activated {
                             claims: claims.clone(),
-                            online_activation_url: Some(urls.browser.clone()),
+                            followup_online_activation_url: Some(urls.browser.clone()),
                         },
                         None,
                     ));
@@ -574,7 +574,7 @@ fn publish_activation(
         .send((
             ActivationState::Activated {
                 claims,
-                online_activation_url: None,
+                followup_online_activation_url: None,
             },
             token_to_cache,
         ))

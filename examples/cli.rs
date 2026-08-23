@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use console::style;
-use dialoguer::{Input, Select, theme::ColorfulTheme};
+use dialoguer::{theme::ColorfulTheme, Input, Select};
 use indicatif::{ProgressBar, ProgressStyle};
 use moonbase_licensing::{ActivationState, LicenseActivationConfig, LicenseActivator};
 use std::env;
@@ -41,7 +41,7 @@ fn run_activation(activator: &mut LicenseActivator) -> Result<()> {
         match activator.poll() {
             Some(ActivationState::Activated {
                 claims,
-                online_activation_url,
+                followup_online_activation_url: online_activation_url,
             }) => {
                 if !claims.trial {
                     spinner.finish_and_clear();
