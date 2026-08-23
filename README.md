@@ -26,10 +26,10 @@ updating your UI and internal state in response.
 let config = /* ... configuration ... */;
 let mut activator = LicenseActivator::spawn(config);
 
-let mut activated = false;
+let mut purchased = false;
 
 // then fetch status and errors regularly, for example on your UI thread:
-if !activated {
+if !purchased {
     while let Ok(activation_state) = activator.state_recv.try_recv() {
         match activation_state {
             ActivationState::NeedsActivation(activation_url_browser) => {
@@ -37,11 +37,27 @@ if !activated {
                 // you can direct the user to open it in the browser,
                 // if it is None, only offline activation is available at this point
             }
-            ActivationState::Activated(claims) => {
-                // activation has been successful - you can stop fetching state updates now
-                // and store the claims (username, whether it's a trial, etc) somewhere for later use
-                activated = true;
-                break;
+            ActivationState::Activated {
+                claims,
+                online_activation_url,
+            } => {
+                // activation has been successful - grant access and store the claims
+                // (username, whether it's a trial, etc) somewhere for later use
+                if claims.trial {
+                    // if the activation was a trial activation,
+                    // you can give the user the option to
+                    // go through the activation flow again
+                    // to install their real license.
+
+                    if let Some(url) = online_activation_url {
+                        // the URL for follow-up online activation checks.
+                    }
+                } else {
+                    // a non-trial activation finishes the
+                    // activator's flow, stop polling
+                    purchased = true;
+                    break;
+                }
             }
         }
     }
@@ -93,46 +109,26 @@ config:
   layout: dagre
 ---
 flowchart TD
- subgraph CacheFlow["Cached Token Flow"]
-        C{"Cached token exists?"}
-        V{"Younger than refresh threshold?"}
-        Activated1["Activated (from cache)"]
-        R{"Refresh successful?"}
-        Activated2["Activated (refreshed)"]
-        NeedsAct["Needs Activation"]
-  end
- subgraph OfflineFlow["Offline Activation"]
-        Offline["User provides offline token"]
-        Activated3["Activated (offline)"]
-        Err1["Error: Offline token invalid"]
-  end
- subgraph OnlineFlow["Online Activation"]
-        Online["Request online activation URL"]
-        URL["User opens browser"]
-        Poll{"Token active online?"}
-        Activated4["Activated (online)"]
-        Wait["Keep polling..."]
-  end
-    C -- Yes --> V
-    V -- Yes --> Activated1
-    V -- No --> R
-    R -- Yes --> Activated2
-    R -- No --> NeedsAct
-    C -- No --> NeedsAct
-    NeedsAct --> Offline & Online
-    Offline -- Valid --> Activated3
-    Offline -- Invalid --> Err1
-    Online --> URL
-    URL --> Poll
-    Poll -- Yes --> Activated4
-    Poll -- No --> Wait
-    Wait --> Poll
-    Start(["Start Activation"]) --> C
-     Activated1:::state
-     Activated2:::state
-     Activated3:::state
-     Err1:::err
-     Activated4:::state
+    Start(["Start activator"]) --> Cache{"Valid cached token?"}
+    Cache -- No --> Needs["Needs activation"]
+    Cache -- Yes --> Activated["Activated"]
+    Needs --> Request["Request online activation URL"]
+    Request --> Choice{"Activation method"}
+    Choice -- Offline token --> Offline{"Token valid?"}
+    Offline -- No --> Error["Error: offline token invalid"]
+    Offline -- Yes --> Paid
+    Choice -- Open browser and enable polling --> Poll{"Online token active?"}
+    Poll -- No --> Poll
+    Poll -- Yes --> Activated
+    Activated --> Trial{"Trial?"}
+    Trial -- No --> Paid["Purchased license active"]
+    Trial -- Yes --> Prefetch["Prefetch next online activation URL"]
+    Prefetch --> TrialUrl["Activated trial with purchase URL"]
+    TrialUrl --> Choice
+     Activated:::state
+     TrialUrl:::state
+     Paid:::state
+     Error:::err
     classDef state fill:#eef,stroke:#88f,color:#003
     classDef err fill:#fee,stroke:#f88,color:#700
 ```

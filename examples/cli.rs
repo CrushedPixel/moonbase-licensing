@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use console::style;
-use dialoguer::{theme::ColorfulTheme, Input, Select};
+use dialoguer::{Input, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
 use moonbase_licensing::{ActivationState, LicenseActivationConfig, LicenseActivator};
 use std::env;
@@ -26,21 +26,26 @@ fn main() -> Result<()> {
     // check initial license activation status (cached file)
 
     match activator.state_recv.recv() {
-        Ok(ActivationState::Activated(claims)) => {
+        Ok(ActivationState::Activated { claims, .. }) if claims.trial => {
+            println!("{} License is active", style("✓").green().bold());
+            print_license_details(&claims);
+            run_activation(&mut activator, true)?;
+        }
+        Ok(ActivationState::Activated { claims, .. }) => {
             println!("{} License is active", style("✓").green().bold());
             print_license_details(&claims);
         }
         Ok(ActivationState::NeedsActivation(_)) | Err(_) => {
             println!("{} No active license found\n", style("⚠").yellow());
-            run_activation(&mut activator)?;
+            run_activation(&mut activator, false)?;
         }
     }
 
     Ok(())
 }
 
-/// Runs the activation process
-fn run_activation(activator: &mut LicenseActivator) -> Result<()> {
+/// Runs the activation process until a purchased license is active.
+fn run_activation(activator: &mut LicenseActivator, mut trial_active: bool) -> Result<()> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.cyan} {msg}")?);
     spinner.set_message("Starting activation...");
@@ -50,14 +55,49 @@ fn run_activation(activator: &mut LicenseActivator) -> Result<()> {
 
     loop {
         match activator.state_recv.try_recv() {
-            Ok(ActivationState::Activated(claims)) => {
-                spinner.finish_and_clear();
-                println!(
-                    "\n{} License activated successfully!",
-                    style("✓").green().bold()
-                );
-                print_license_details(&claims);
-                break;
+            Ok(ActivationState::Activated {
+                claims,
+                online_activation_url,
+            }) => {
+                if !claims.trial {
+                    spinner.finish_and_clear();
+                    println!(
+                        "\n{} License activated successfully!",
+                        style("✓").green().bold()
+                    );
+                    print_license_details(&claims);
+                    break;
+                }
+
+                if !trial_active {
+                    spinner.finish_and_clear();
+                    println!(
+                        "\n{} Trial activated successfully!",
+                        style("✓").green().bold()
+                    );
+                    print_license_details(&claims);
+                    trial_active = true;
+                }
+
+                if online_activation_url.is_none() {
+                    activation_url = None;
+                    user_chose_method = false;
+                    spinner.set_message("Requesting purchased activation URL...");
+                }
+
+                if let Some(url) = online_activation_url
+                    && !user_chose_method
+                    && activation_url.as_ref() != Some(&url)
+                {
+                    activation_url = Some(url.clone());
+                    spinner.finish_and_clear();
+                    user_chose_method = true;
+                    handle_activation_options(&url, activator)?;
+
+                    // Restart spinner after user interaction
+                    spinner.set_message("Waiting for purchased activation...");
+                    spinner.enable_steady_tick(Duration::from_millis(100));
+                }
             }
             Ok(ActivationState::NeedsActivation(Some(url))) => {
                 if !user_chose_method && activation_url.as_ref() != Some(&url) {
