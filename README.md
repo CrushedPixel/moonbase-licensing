@@ -18,7 +18,7 @@ consuming the `LicenseActivator`'s state changes and error notifications.
 
 > For an example CLI using all library features, please visit [examples/cli.rs](examples/cli.rs)
 
-The usage is simple: spawn a `LicenseActivator` and read from the `state_recv` and `error_recv` receivers periodically,
+The usage is simple: spawn a `LicenseActivator`, call `poll`, and read from the `error_recv` receiver periodically,
 updating your UI and internal state in response.
 
 ```rust
@@ -26,45 +26,39 @@ updating your UI and internal state in response.
 let config = /* ... configuration ... */;
 let mut activator = LicenseActivator::spawn(config);
 
-let mut purchased = false;
-
 // then fetch status and errors regularly, for example on your UI thread:
-if !purchased {
-    while let Ok(activation_state) = activator.state_recv.try_recv() {
-        match activation_state {
-            ActivationState::NeedsActivation(activation_url_browser) => {
-                // update GUI accordingly - if activation_url_browser is provided,
-                // you can direct the user to open it in the browser,
-                // if it is None, only offline activation is available at this point
-            }
-            ActivationState::Activated {
-                claims,
-                online_activation_url,
-            } => {
-                // activation has been successful - grant access and store the claims
-                // (username, whether it's a trial, etc) somewhere for later use
-                if claims.trial {
-                    // if the activation was a trial activation,
-                    // you can give the user the option to
-                    // go through the activation flow again
-                    // to install their real license.
+if let Some(activation_state) = activator.poll() {
+    match activation_state {
+        ActivationState::NeedsActivation(activation_url_browser) => {
+            // update GUI accordingly - if activation_url_browser is provided,
+            // you can direct the user to open it in the browser,
+            // if it is None, only offline activation is available at this point
+        }
+        ActivationState::Activated {
+            claims,
+            online_activation_url,
+        } => {
+            // activation has been successful - grant access and store the claims
+            // (username, whether it's a trial, etc) somewhere for later use
+            if claims.trial {
+                // if the activation was a trial activation,
+                // you can give the user the option to
+                // go through the activation flow again
+                // to install their real license.
 
-                    if let Some(url) = online_activation_url {
-                        // the URL for follow-up online activation checks.
-                    }
-                } else {
-                    // a non-trial activation finishes the
-                    // activator's flow, stop polling
-                    purchased = true;
-                    break;
+                if let Some(url) = online_activation_url {
+                    // the URL for follow-up online activation checks.
                 }
+            } else {
+                // a non-trial activation finishes the activator's flow.
+                // poll will not return any more activation states.
             }
         }
     }
+}
 
-    while let Ok(error) = activator.error_recv.try_recv() {
-        // an error has been encountered - display it to the user at your discretion
-    }
+while let Ok(error) = activator.error_recv.try_recv() {
+    // an error has been encountered - display it to the user at your discretion
 }
 
 // to write a machine file to disk for offline activation:
@@ -109,21 +103,21 @@ config:
   layout: dagre
 ---
 flowchart TD
-    Start(["Start activator"]) --> Cache{"Valid cached token?"}
-    Cache -- No --> Needs["Needs activation"]
+    Start(["Start Activation"]) --> Cache{"Cached token exists?"}
+    Cache -- No --> Needs["Needs Activation"]
     Cache -- Yes --> Activated["Activated"]
     Needs --> Request["Request online activation URL"]
     Request --> Choice{"Activation method"}
-    Choice -- Offline token --> Offline{"Token valid?"}
-    Offline -- No --> Error["Error: offline token invalid"]
-    Offline -- Yes --> Paid
-    Choice -- Open browser and enable polling --> Poll{"Online token active?"}
+    Choice -- User provides offline token --> Offline{"Offline token valid?"}
+    Offline -- Invalid --> Error["Error: Offline token invalid"]
+    Offline -- Valid --> Paid
+    Choice -- User opens browser --> Poll{"Token active online?"}
     Poll -- No --> Poll
     Poll -- Yes --> Activated
     Activated --> Trial{"Trial?"}
-    Trial -- No --> Paid["Purchased license active"]
-    Trial -- Yes --> Prefetch["Prefetch next online activation URL"]
-    Prefetch --> TrialUrl["Activated trial with purchase URL"]
+    Trial -- No --> Paid["Activated (purchased)"]
+    Trial -- Yes --> Prefetch
+    Prefetch["Prefetch next online activation URL"] --> TrialUrl["Activated (trial, purchase URL)"]
     TrialUrl --> Choice
      Activated:::state
      TrialUrl:::state

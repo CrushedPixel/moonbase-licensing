@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::{JoinHandle, Thread};
 use std::time::Duration;
 use std::{fs, io, thread};
@@ -164,19 +164,12 @@ pub struct LicenseActivationConfig {
 pub struct LicenseActivator {
     cfg: LicenseActivationConfig,
 
-    /// Receiver for the main thread to poll changes to the license activation state.
-    ///
-    /// Once a non-trial [ActivationState::Activated] has been received,
-    /// the consumer can stop reading from this channel,
-    /// as the license activation won't be revoked again during this session.
-    /// Trial activations may be followed by a replacement activation URL
-    /// and a purchased activation.
-    ///
-    /// Until the first value is received,
-    /// the license activation state is undetermined,
-    /// and the user should just be shown a "loading" state.
-    pub state_recv: Receiver<ActivationState>,
-    state_send: Sender<ActivationState>,
+    /// Receiver for activation states and any accepted token that must be cached.
+    state_recv: Receiver<(ActivationState, Option<String>)>,
+    /// Sender used to publish directly submitted offline activations.
+    state_send: Sender<(ActivationState, Option<String>)>,
+    /// Whether a purchased activation has already been returned by [Self::poll].
+    activation_finished: bool,
 
     /// Receiver for the main thread to poll errors encountered during license activation.
     ///
@@ -196,10 +189,6 @@ pub struct LicenseActivator {
     /// so you must enable it again if you open
     /// the follow-up online activation URL in the user's browser.
     pub poll_online_activation: Arc<AtomicBool>,
-
-    /// Mutex to ensure offline activation
-    /// doesn't interfere with other state emissions.
-    offline_activation_mutex: Arc<Mutex<()>>,
 
     /// Whether the worker thread should keep running.
     running: Arc<AtomicBool>,
@@ -236,10 +225,6 @@ impl LicenseActivator {
         let poll_online_activation = Arc::new(AtomicBool::new(false));
         let poll_online_activation_clone = poll_online_activation.clone();
 
-        // serialize worker state updates with direct offline activation
-        let offline_activation_mutex = Arc::new(Mutex::new(()));
-        let offline_activation_mutex_clone = offline_activation_mutex.clone();
-
         let state_send_clone = state_send.clone();
         let error_send_clone = error_send.clone();
         let cfg_clone = cfg.clone();
@@ -250,7 +235,6 @@ impl LicenseActivator {
                 state_send_clone,
                 error_send_clone,
                 poll_online_activation_clone,
-                offline_activation_mutex_clone,
                 cfg_clone,
             );
         });
@@ -262,13 +246,13 @@ impl LicenseActivator {
 
             state_recv,
             state_send,
+            activation_finished: false,
 
             error_recv,
             error_send,
 
             poll_online_activation,
 
-            offline_activation_mutex,
             running,
             worker_thread,
             worker_join: Some(join),
@@ -285,35 +269,79 @@ impl LicenseActivator {
         .serialize()
     }
 
+    /// Polls and returns the most recent activation state update, if any is available.
+    ///
+    /// Until the first value is returned, the license activation state is undetermined,
+    /// and the user should just be shown a "loading" state.
+    ///
+    /// After a trial activation, you may receive another [ActivationState::Activated]
+    /// with an URL to perform a follow-up non-trial activation.
+    ///
+    /// After a non-trial activation, the activator stops and you can stop polling.
+    pub fn poll(&mut self) -> Option<ActivationState> {
+        if self.activation_finished {
+            return None;
+        }
+
+        let mut latest_state = None;
+        let mut token_to_save = None;
+
+        // drain updates so the caller receives only most recent state
+        while let Ok((state, new_token)) = self.state_recv.try_recv() {
+            // whenever the worker emits an activation state
+            // _with_ a follow-up online activation url,
+            // it previously already sent one without,
+            // so we don't need to save token to file in this case.
+            if matches!(
+                &state,
+                ActivationState::Activated {
+                    online_activation_url: None,
+                    ..
+                }
+            ) {
+                token_to_save = new_token;
+            }
+
+            if matches!(
+                &state,
+                ActivationState::Activated { claims, .. } if !claims.trial
+            ) {
+                // a non-trial activation finishes the flow
+                self.activation_finished = true;
+                latest_state = Some(state);
+                break;
+            }
+
+            latest_state = Some(state);
+        }
+
+        // save token to file
+        if let Some(token) = token_to_save
+            && let Err(e) = fs::write(&self.cfg.cached_token_path, token)
+        {
+            _ = self.error_send.send(ActivationError::SaveCachedToken(e));
+        }
+
+        latest_state
+    }
+
     /// Submits the given offline activation token for validation,
-    /// caching it on disk if it's valid.
+    /// queuing it to be cached if it's valid.
     ///
     /// The result of the validation can be obtained
-    /// from the state and error receivers as usual.
+    /// by polling activation states and errors as usual.
     pub fn submit_offline_activation_token(&mut self, token: &str) {
         match self.check_offline_activation_token(token) {
             Ok(claims) => {
-                let _lock = self.offline_activation_mutex.lock().unwrap();
-                if !self.running.load(Ordering::Relaxed) {
-                    return;
-                }
-
-                // stop the worker thread, as we don't need any more validation from here on
-                self.running.store(false, Ordering::Relaxed);
-
-                // the software has been activated!
-                _ = self.state_send.send(ActivationState::Activated {
+                if publish_activation(
+                    &self.running,
+                    &self.state_send,
                     claims,
-                    online_activation_url: None,
-                });
-
-                // persist the token on disk
-                if let Err(e) = fs::write(&self.cfg.cached_token_path, token) {
-                    _ = self.error_send.send(ActivationError::SaveCachedToken(e));
+                    Some(token.to_string()),
+                ) {
+                    // interrupt the worker's timed wait so it can stop immediately
+                    self.worker_thread.unpark();
                 }
-
-                // interrupt the worker's timed wait so it can stop immediately
-                self.worker_thread.unpark();
             }
             Err(e) => _ = self.error_send.send(ActivationError::OfflineToken(e)),
         }
@@ -344,81 +372,54 @@ impl LicenseActivationConfig {
 
 fn worker_thread(
     running: Arc<AtomicBool>,
-    state_send: Sender<ActivationState>,
+    state_send: Sender<(ActivationState, Option<String>)>,
     error_send: Sender<ActivationError>,
     poll_online_activation: Arc<AtomicBool>,
-    offline_activation_mutex: Arc<Mutex<()>>,
     cfg: LicenseActivationConfig,
 ) {
-    // lock offline activation via mutex.
-    // check if offline activation has succeeded, and exit the thread if so.
-    // the lock must be in scope while publishing a new activation state to avoid
-    // 
-    macro_rules! lock_offline_activation {
-        () => {
-            let _lock = offline_activation_mutex.lock().unwrap();
-            if !running.load(Ordering::Relaxed) {
-                return;
-            }
-        };
-    }
-
-    // persist tokens on disk and report any failures to the calling thread
-    let save_token = |token: &str| {
-        if let Err(e) = fs::write(&cfg.cached_token_path, token) {
-            _ = error_send.send(ActivationError::SaveCachedToken(e));
-        }
-    };
-
     let mut active_trial = None;
 
     // first, try to load a cached license token from disk
     let cached_result = check_cached_token(&cfg, running.clone(), false);
 
-    {
-        lock_offline_activation!();
+    if !running.load(Ordering::Relaxed) {
+        return;
+    }
 
-        match cached_result {
-            Ok(Some(result)) => {
-                let claims = result.claims;
+    match cached_result {
+        Ok(Some(result)) => {
+            let claims = result.claims;
 
-                // grant access immediately, without waiting for another activation URL
-                _ = state_send.send(ActivationState::Activated {
-                    claims: claims.clone(),
-                    online_activation_url: None,
-                });
-                if let Some(token) = result.new_token {
-                    // persist the new token on disk
-                    save_token(&token);
-                }
-
-                if claims.trial {
-                    // result polling must be enabled explicitly for the replacement activation
-                    poll_online_activation.store(false, Ordering::Relaxed);
-                    active_trial = Some(claims);
-                } else {
-                    // a purchased cached license finishes activation
-                    running.store(false, Ordering::Relaxed);
-                    return;
-                }
+            // grant access immediately, without waiting for another activation URL
+            if !publish_activation(&running, &state_send, claims.clone(), result.new_token) {
+                return;
             }
-            Ok(None) => {
-                // no cached token was found
-            }
-            Err(e) => {
-                // cached token couldn't be validated
-                _ = error_send.send(ActivationError::LoadCachedToken(e));
+
+            if claims.trial {
+                // result polling must be enabled explicitly for the replacement activation
+                poll_online_activation.store(false, Ordering::Relaxed);
+                active_trial = Some(claims);
+            } else {
+                // a purchased cached license finishes activation
+                return;
             }
         }
-
-        if active_trial.is_none() {
-            // we don't have a valid cached token -
-            // the user has to activate the plugin either offline or online.
-
-            // we don't yet have a URL to provide for online activation,
-            // but we can supply that in a subsequent state update.
-            _ = state_send.send(ActivationState::NeedsActivation(None));
+        Ok(None) => {
+            // no cached token was found
         }
+        Err(e) => {
+            // cached token couldn't be validated
+            _ = error_send.send(ActivationError::LoadCachedToken(e));
+        }
+    }
+
+    if active_trial.is_none() {
+        // we don't have a valid cached token -
+        // the user has to activate the plugin either offline or online.
+
+        // we don't yet have a URL to provide for online activation,
+        // but we can supply that in a subsequent state update.
+        _ = state_send.send((ActivationState::NeedsActivation(None), None));
     }
 
     'request_url: while running.load(Ordering::Relaxed) {
@@ -431,34 +432,38 @@ fn worker_thread(
             )
             .when(|_| running.load(Ordering::Relaxed))
             .call();
-        let activation_urls;
 
-        {
-            lock_offline_activation!();
+        if !running.load(Ordering::Relaxed) {
+            return;
+        }
 
-            activation_urls = match requested_urls {
-                Ok(urls) => {
-                    // we got the URLs for online activation
-                    if let Some(claims) = active_trial.as_ref() {
-                        // send the follow-up URL while preserving the active trial claims
-                        _ = state_send.send(ActivationState::Activated {
+        let activation_urls = match requested_urls {
+            Ok(urls) => {
+                // we got the URLs for online activation
+                if let Some(claims) = active_trial.as_ref() {
+                    // send the follow-up URL while preserving the active trial claims
+                    _ = state_send.send((
+                        ActivationState::Activated {
                             claims: claims.clone(),
                             online_activation_url: Some(urls.browser.clone()),
-                        });
-                    } else {
-                        // send the user-facing activation URL to the main thread
-                        _ = state_send
-                            .send(ActivationState::NeedsActivation(Some(urls.browser.clone())));
-                    }
-                    Some(urls)
+                        },
+                        None,
+                    ));
+                } else {
+                    // send the user-facing activation URL to the main thread
+                    _ = state_send.send((
+                        ActivationState::NeedsActivation(Some(urls.browser.clone())),
+                        None,
+                    ));
                 }
-                Err(e) => {
-                    // we couldn't get an online activation URL from Moonbase after several tries
-                    _ = error_send.send(ActivationError::FetchActivationUrl(e));
-                    None
-                }
-            };
-        }
+                Some(urls)
+            }
+            Err(e) => {
+                // we couldn't get an online activation URL from Moonbase after several tries
+                _ = error_send.send(ActivationError::FetchActivationUrl(e));
+                None
+            }
+        };
 
         // now we're waiting for the user to activate the plugin,
         // for another instance to install a license, or for the thread to be stopped
@@ -466,8 +471,8 @@ fn worker_thread(
             // park instead of sleeping so shutdown and offline activation can wake the worker
             thread::park_timeout(Duration::from_secs(5));
 
-            {
-                lock_offline_activation!();
+            if !running.load(Ordering::Relaxed) {
+                return;
             }
 
             if let Some(urls) = activation_urls.as_ref()
@@ -477,7 +482,9 @@ fn worker_thread(
                 // check if they have succeeded
                 let activation_result = moonbase_check_online_activation(&cfg, &urls.request);
 
-                lock_offline_activation!();
+                if !running.load(Ordering::Relaxed) {
+                    return;
+                }
 
                 match activation_result {
                     Ok(Some((token, claims))) => {
@@ -486,13 +493,9 @@ fn worker_thread(
                             // the next online result must not be polled until explicitly enabled
                             poll_online_activation.store(false, Ordering::Relaxed);
                         }
-                        _ = state_send.send(ActivationState::Activated {
-                            claims: claims.clone(),
-                            online_activation_url: None,
-                        });
-
-                        // persist the token on disk
-                        save_token(&token);
+                        if !publish_activation(&running, &state_send, claims.clone(), Some(token)) {
+                            return;
+                        }
 
                         if claims.trial {
                             // keep the trial active and prefetch its replacement activation URL
@@ -501,7 +504,6 @@ fn worker_thread(
                         }
 
                         // a purchased license finishes activation
-                        running.store(false, Ordering::Relaxed);
                         return;
                     }
                     Ok(None) => {
@@ -517,7 +519,9 @@ fn worker_thread(
                 let cached_result =
                     check_cached_token(&cfg, running.clone(), active_trial.is_some());
 
-                lock_offline_activation!();
+                if !running.load(Ordering::Relaxed) {
+                    return;
+                }
 
                 if let Ok(Some(result)) = cached_result {
                     let claims = result.claims;
@@ -527,13 +531,9 @@ fn worker_thread(
                     }
 
                     // the software has been activated!
-                    _ = state_send.send(ActivationState::Activated {
-                        claims: claims.clone(),
-                        online_activation_url: None,
-                    });
-                    if let Some(token) = result.new_token {
-                        // persist the new token on disk
-                        save_token(&token);
+                    if !publish_activation(&running, &state_send, claims.clone(), result.new_token)
+                    {
+                        return;
                     }
 
                     if claims.trial {
@@ -543,7 +543,6 @@ fn worker_thread(
                     }
 
                     // a purchased license finishes activation
-                    running.store(false, Ordering::Relaxed);
                     return;
                 }
 
@@ -554,6 +553,32 @@ fn worker_thread(
             }
         }
     }
+}
+
+/// Publishes an accepted activation if it wins the purchased activation race.
+fn publish_activation(
+    running: &AtomicBool,
+    state_send: &Sender<(ActivationState, Option<String>)>,
+    claims: LicenseTokenClaims,
+    token_to_cache: Option<String>,
+) -> bool {
+    if claims.trial {
+        if !running.load(Ordering::Relaxed) {
+            return false;
+        }
+    } else if !running.swap(false, Ordering::Relaxed) {
+        return false;
+    }
+
+    state_send
+        .send((
+            ActivationState::Activated {
+                claims,
+                online_activation_url: None,
+            },
+            token_to_cache,
+        ))
+        .is_ok()
 }
 
 struct CachedTokenCheckResult {
