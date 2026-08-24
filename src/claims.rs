@@ -3,7 +3,7 @@ use chrono::serde::ts_seconds_option;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
-#[derive(Debug, Eq, PartialEq, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub enum ActivationMethod {
     /// The license has been activated offline and is irrevocable,
     /// therefore we mustn't check license validity online.
@@ -15,7 +15,7 @@ pub enum ActivationMethod {
 }
 
 /// The claims included in a validated license token provided by Moonbase.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct LicenseTokenClaims {
     pub method: ActivationMethod,
 

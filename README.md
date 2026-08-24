@@ -18,7 +18,7 @@ consuming the `LicenseActivator`'s state changes and error notifications.
 
 > For an example CLI using all library features, please visit [examples/cli.rs](examples/cli.rs)
 
-The usage is simple: spawn a `LicenseActivator` and read from the `state_recv` and `error_recv` receivers periodically,
+The usage is simple: spawn a `LicenseActivator`, call `poll`, and read from the `error_recv` receiver periodically,
 updating your UI and internal state in response.
 
 ```rust
@@ -26,29 +26,39 @@ updating your UI and internal state in response.
 let config = /* ... configuration ... */;
 let mut activator = LicenseActivator::spawn(config);
 
-let mut activated = false;
-
 // then fetch status and errors regularly, for example on your UI thread:
-if !activated {
-    while let Ok(activation_state) = activator.state_recv.try_recv() {
-        match activation_state {
-            ActivationState::NeedsActivation(activation_url_browser) => {
-                // update GUI accordingly - if activation_url_browser is provided,
-                // you can direct the user to open it in the browser,
-                // if it is None, only offline activation is available at this point
-            }
-            ActivationState::Activated(claims) => {
-                // activation has been successful - you can stop fetching state updates now
-                // and store the claims (username, whether it's a trial, etc) somewhere for later use
-                activated = true;
-                break;
+if let Some(activation_state) = activator.poll() {
+    match activation_state {
+        ActivationState::NeedsActivation(activation_url_browser) => {
+            // update GUI accordingly - if activation_url_browser is provided,
+            // you can direct the user to open it in the browser,
+            // if it is None, only offline activation is available at this point
+        }
+        ActivationState::Activated {
+            claims,
+            online_activation_url,
+        } => {
+            // activation has been successful - grant access and store the claims
+            // (username, whether it's a trial, etc) somewhere for later use
+            if claims.trial {
+                // if the activation was a trial activation,
+                // you can give the user the option to
+                // go through the activation flow again
+                // to install their real license.
+
+                if let Some(url) = online_activation_url {
+                    // the URL for follow-up online activation checks.
+                }
+            } else {
+                // a non-trial activation finishes the activator's flow.
+                // poll will not return any more activation states.
             }
         }
     }
+}
 
-    while let Ok(error) = activator.error_recv.try_recv() {
-        // an error has been encountered - display it to the user at your discretion
-    }
+while let Ok(error) = activator.error_recv.try_recv() {
+    // an error has been encountered - display it to the user at your discretion
 }
 
 // to write a machine file to disk for offline activation:
@@ -93,46 +103,26 @@ config:
   layout: dagre
 ---
 flowchart TD
- subgraph CacheFlow["Cached Token Flow"]
-        C{"Cached token exists?"}
-        V{"Younger than refresh threshold?"}
-        Activated1["Activated (from cache)"]
-        R{"Refresh successful?"}
-        Activated2["Activated (refreshed)"]
-        NeedsAct["Needs Activation"]
-  end
- subgraph OfflineFlow["Offline Activation"]
-        Offline["User provides offline token"]
-        Activated3["Activated (offline)"]
-        Err1["Error: Offline token invalid"]
-  end
- subgraph OnlineFlow["Online Activation"]
-        Online["Request online activation URL"]
-        URL["User opens browser"]
-        Poll{"Token active online?"}
-        Activated4["Activated (online)"]
-        Wait["Keep polling..."]
-  end
-    C -- Yes --> V
-    V -- Yes --> Activated1
-    V -- No --> R
-    R -- Yes --> Activated2
-    R -- No --> NeedsAct
-    C -- No --> NeedsAct
-    NeedsAct --> Offline & Online
-    Offline -- Valid --> Activated3
-    Offline -- Invalid --> Err1
-    Online --> URL
-    URL --> Poll
-    Poll -- Yes --> Activated4
-    Poll -- No --> Wait
-    Wait --> Poll
-    Start(["Start Activation"]) --> C
-     Activated1:::state
-     Activated2:::state
-     Activated3:::state
-     Err1:::err
-     Activated4:::state
+    Start(["Start Activation"]) --> Cache{"Cached token exists?"}
+    Cache -- No --> Needs["Needs Activation"]
+    Cache -- Yes --> Activated["Activated"]
+    Needs --> Request["Request online activation URL"]
+    Request --> Choice{"Activation method"}
+    Choice -- User provides offline token --> Offline{"Offline token valid?"}
+    Offline -- Invalid --> Error["Error: Offline token invalid"]
+    Offline -- Valid --> Paid
+    Choice -- User opens browser --> Poll{"Token active online?"}
+    Poll -- No --> Poll
+    Poll -- Yes --> Activated
+    Activated --> Trial{"Trial?"}
+    Trial -- No --> Paid["Activated (purchased)"]
+    Trial -- Yes --> Prefetch
+    Prefetch["Prefetch next online activation URL"] --> TrialUrl["Activated (trial, purchase URL)"]
+    TrialUrl --> Choice
+     Activated:::state
+     TrialUrl:::state
+     Paid:::state
+     Error:::err
     classDef state fill:#eef,stroke:#88f,color:#003
     classDef err fill:#fee,stroke:#f88,color:#700
 ```

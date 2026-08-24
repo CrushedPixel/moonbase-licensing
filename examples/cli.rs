@@ -21,25 +21,13 @@ fn main() -> Result<()> {
     let config = get_configuration()?;
     print_configuration(&config);
 
-    let mut activator = LicenseActivator::spawn(config.clone());
-
-    // check initial license activation status (cached file)
-
-    match activator.state_recv.recv() {
-        Ok(ActivationState::Activated(claims)) => {
-            println!("{} License is active", style("✓").green().bold());
-            print_license_details(&claims);
-        }
-        Ok(ActivationState::NeedsActivation(_)) | Err(_) => {
-            println!("{} No active license found\n", style("⚠").yellow());
-            run_activation(&mut activator)?;
-        }
-    }
+    let mut activator = LicenseActivator::spawn(config);
+    run_activation(&mut activator)?;
 
     Ok(())
 }
 
-/// Runs the activation process
+/// Runs the activation process until a purchased license is active.
 fn run_activation(activator: &mut LicenseActivator) -> Result<()> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(ProgressStyle::default_spinner().template("{spinner:.cyan} {msg}")?);
@@ -47,19 +35,55 @@ fn run_activation(activator: &mut LicenseActivator) -> Result<()> {
 
     let mut activation_url: Option<String> = None;
     let mut user_chose_method = false;
+    let mut trial_active = false;
 
     loop {
-        match activator.state_recv.try_recv() {
-            Ok(ActivationState::Activated(claims)) => {
-                spinner.finish_and_clear();
-                println!(
-                    "\n{} License activated successfully!",
-                    style("✓").green().bold()
-                );
-                print_license_details(&claims);
-                break;
+        match activator.poll() {
+            Some(ActivationState::Activated {
+                claims,
+                followup_online_activation_url: online_activation_url,
+            }) => {
+                if !claims.trial {
+                    spinner.finish_and_clear();
+                    println!(
+                        "\n{} License activated successfully!",
+                        style("✓").green().bold()
+                    );
+                    print_license_details(&claims);
+                    break;
+                }
+
+                if !trial_active {
+                    spinner.finish_and_clear();
+                    println!(
+                        "\n{} Trial activated successfully!",
+                        style("✓").green().bold()
+                    );
+                    print_license_details(&claims);
+                    trial_active = true;
+                }
+
+                if online_activation_url.is_none() {
+                    activation_url = None;
+                    user_chose_method = false;
+                    spinner.set_message("Requesting purchased activation URL...");
+                }
+
+                if let Some(url) = online_activation_url
+                    && !user_chose_method
+                    && activation_url.as_ref() != Some(&url)
+                {
+                    activation_url = Some(url.clone());
+                    spinner.finish_and_clear();
+                    user_chose_method = true;
+                    handle_activation_options(&url, activator)?;
+
+                    // Restart spinner after user interaction
+                    spinner.set_message("Waiting for purchased activation...");
+                    spinner.enable_steady_tick(Duration::from_millis(100));
+                }
             }
-            Ok(ActivationState::NeedsActivation(Some(url))) => {
+            Some(ActivationState::NeedsActivation(Some(url))) => {
                 if !user_chose_method && activation_url.as_ref() != Some(&url) {
                     activation_url = Some(url.clone());
                     spinner.finish_and_clear();
@@ -71,10 +95,10 @@ fn run_activation(activator: &mut LicenseActivator) -> Result<()> {
                     spinner.enable_steady_tick(Duration::from_millis(100));
                 }
             }
-            Ok(ActivationState::NeedsActivation(None)) => {
+            Some(ActivationState::NeedsActivation(None)) => {
                 spinner.set_message("Requesting activation URL...");
             }
-            Err(_) => {
+            None => {
                 // No update yet
             }
         }
