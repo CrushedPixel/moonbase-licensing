@@ -307,6 +307,7 @@ fn get_configuration() -> Result<LicenseActivationConfig> {
         device_signature,
         device_name,
         cached_token_path,
+        online_token_refresh_threshold: Duration::from_secs(24 * 3600),
         online_token_expiration_threshold: Duration::from_secs(3600),
     })
 }

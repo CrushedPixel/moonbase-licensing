@@ -172,6 +172,9 @@ pub struct LicenseActivationConfig {
     /// The unique signature of the device the software is running on.
     pub device_signature: String,
 
+    /// The age threshold beyond which the activator attempts to refresh online tokens.
+    /// Before this age, the token is accepted without attempting any further online validation.
+    pub online_token_refresh_threshold: Duration,
     /// The age threshold beyond which an online token is deemed
     /// too old to trust and must be refreshed before being accepted.
     /// Cached online tokens older than this do not grant provisional access.
@@ -774,10 +777,28 @@ fn check_cached_token(
                         }));
                     }
                     ActivationMethod::Online => {
+                        // it's an online activated token,
+                        // so we should check if it's still valid
+                        let now = Utc::now();
+                        if cached_token_can_defer_refresh(
+                            claims.last_validated,
+                            cfg.online_token_refresh_threshold,
+                            cfg.online_token_expiration_threshold,
+                            now,
+                        ) {
+                            // if the token was last validated very recently,
+                            // we just accept it and don't even attempt to refresh and validate it.
+                            // this minimizes API requests and waiting time for the user.
+                            return Ok(CachedTokenCheckOutcome::Accepted(CachedTokenCheckResult {
+                                claims,
+                                token,
+                            }));
+                        }
+
                         if cached_token_within_expiration(
                             claims.last_validated,
                             cfg.online_token_expiration_threshold,
-                            Utc::now(),
+                            now,
                         ) && published_cached_token.as_ref() != Some(&token)
                         {
                             if !publish_activation(
@@ -795,8 +816,6 @@ fn check_cached_token(
                             published_cached_token = Some(token.clone());
                         }
 
-                        // it's an online activated token,
-                        // so we should check if it's still valid
                         let provisional_access = published_cached_token.as_ref() == Some(&token);
                         let validation_result = (|| moonbase_refresh_token(cfg, &token))
                             .retry(
@@ -883,6 +902,17 @@ fn check_cached_token(
             Err(e) => return Err(e.into()),
         }
     }
+}
+
+fn cached_token_can_defer_refresh(
+    last_validated: DateTime<Utc>,
+    refresh_threshold: Duration,
+    expiration_threshold: Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    (now - last_validated)
+        .to_std()
+        .is_ok_and(|age| age < refresh_threshold && age < expiration_threshold)
 }
 
 fn cached_token_within_expiration(
