@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use console::style;
-use dialoguer::{theme::ColorfulTheme, Input, Select};
+use dialoguer::{Input, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
-use moonbase_licensing::{ActivationState, LicenseActivationConfig, LicenseActivator};
+use moonbase_licensing::{
+    ActivationState, ActivationType, LicenseActivationConfig, LicenseActivator,
+};
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -35,15 +37,33 @@ fn run_activation(activator: &mut LicenseActivator) -> Result<()> {
 
     let mut activation_url: Option<String> = None;
     let mut user_chose_method = false;
+    let mut provisional_active = false;
     let mut trial_active = false;
 
     loop {
         match activator.poll() {
-            Some(ActivationState::Activated {
-                claims,
-                followup_online_activation_url: online_activation_url,
-            }) => {
-                if !claims.trial {
+            Some(ActivationState::Activated(claims, activation_type)) => match activation_type {
+                ActivationType::Cached => {
+                    if !provisional_active {
+                        spinner.finish_and_clear();
+                        println!(
+                            "\n{} License grants provisional access!",
+                            style("✓").green().bold()
+                        );
+                        print_license_details(&claims);
+                        provisional_active = true;
+                    }
+
+                    activation_url = None;
+                    user_chose_method = false;
+                    spinner.set_message(if claims.trial {
+                        "Requesting follow-up activation URL..."
+                    } else {
+                        "Confirming cached license online..."
+                    });
+                    spinner.enable_steady_tick(Duration::from_millis(100));
+                }
+                ActivationType::Confirmed => {
                     spinner.finish_and_clear();
                     println!(
                         "\n{} License activated successfully!",
@@ -52,51 +72,58 @@ fn run_activation(activator: &mut LicenseActivator) -> Result<()> {
                     print_license_details(&claims);
                     break;
                 }
+                ActivationType::Trial(url) => {
+                    provisional_active = false;
+                    if !trial_active {
+                        spinner.finish_and_clear();
+                        println!(
+                            "\n{} Trial activated successfully!",
+                            style("✓").green().bold()
+                        );
+                        print_license_details(&claims);
+                        trial_active = true;
+                        activation_url = None;
+                        user_chose_method = false;
+                    }
 
-                if !trial_active {
+                    if !user_chose_method && activation_url.as_ref() != Some(&url) {
+                        activation_url = Some(url.clone());
+                        spinner.finish_and_clear();
+                        user_chose_method = true;
+                        handle_activation_options(&url, activator)?;
+
+                        // Restart spinner after user interaction
+                        spinner.set_message("Waiting for purchased activation...");
+                        spinner.enable_steady_tick(Duration::from_millis(100));
+                    }
+                }
+            },
+            Some(ActivationState::NeedsActivation(online_activation_url)) => {
+                if provisional_active {
                     spinner.finish_and_clear();
                     println!(
-                        "\n{} Trial activated successfully!",
-                        style("✓").green().bold()
+                        "\n{} Cached license could not be confirmed; activation is required.",
+                        style("⚠").yellow().bold()
                     );
-                    print_license_details(&claims);
-                    trial_active = true;
-                }
-
-                if online_activation_url.is_none() {
+                    provisional_active = false;
                     activation_url = None;
                     user_chose_method = false;
-                    spinner.set_message("Requesting purchased activation URL...");
                 }
 
-                if let Some(url) = online_activation_url
-                    && !user_chose_method
-                    && activation_url.as_ref() != Some(&url)
-                {
-                    activation_url = Some(url.clone());
-                    spinner.finish_and_clear();
-                    user_chose_method = true;
-                    handle_activation_options(&url, activator)?;
+                if let Some(url) = online_activation_url {
+                    if !user_chose_method && activation_url.as_ref() != Some(&url) {
+                        activation_url = Some(url.clone());
+                        spinner.finish_and_clear();
+                        user_chose_method = true;
+                        handle_activation_options(&url, activator)?;
 
-                    // Restart spinner after user interaction
-                    spinner.set_message("Waiting for purchased activation...");
-                    spinner.enable_steady_tick(Duration::from_millis(100));
+                        // Restart spinner after user interaction
+                        spinner.set_message("Waiting for activation...");
+                        spinner.enable_steady_tick(Duration::from_millis(100));
+                    }
+                } else {
+                    spinner.set_message("Requesting activation URL...");
                 }
-            }
-            Some(ActivationState::NeedsActivation(Some(url))) => {
-                if !user_chose_method && activation_url.as_ref() != Some(&url) {
-                    activation_url = Some(url.clone());
-                    spinner.finish_and_clear();
-                    user_chose_method = true;
-                    handle_activation_options(&url, activator)?;
-
-                    // Restart spinner after user interaction
-                    spinner.set_message("Waiting for activation...");
-                    spinner.enable_steady_tick(Duration::from_millis(100));
-                }
-            }
-            Some(ActivationState::NeedsActivation(None)) => {
-                spinner.set_message("Requesting activation URL...");
             }
             None => {
                 // No update yet
@@ -280,7 +307,6 @@ fn get_configuration() -> Result<LicenseActivationConfig> {
         device_signature,
         device_name,
         cached_token_path,
-        online_token_refresh_threshold: Duration::from_secs(24 * 3600),
         online_token_expiration_threshold: Duration::from_secs(3600),
     })
 }
