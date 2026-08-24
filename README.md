@@ -68,6 +68,18 @@ std::fs::write(&path, &machine_file)?;
 activator.submit_offline_activation_token(&activation_token);
 ```
 
+## Online activation polling
+
+While `poll_online_activation` is true, the license activator polls the Moonbase API
+to check if the user has activated the license online.
+
+The flag is false initially. Set it to true when the user opens the online activation URL,
+and set it to false whenever the user isn't on the online activation screen
+to avoid spamming the Moonbase API and getting rate limited.
+
+The flag is set to false automatically when a trial license is installed,
+so you must enable it again if the user opens the follow-up online activation URL.
+
 ## Online token expiration
 
 Because Moonbase license tokens created using **Online** activation can be revoked
