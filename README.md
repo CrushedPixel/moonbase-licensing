@@ -115,46 +115,18 @@ their signed expiration, if any, and only on the device whose signature they con
 Here's a rough overview of the `LicenseActivator`'s logic:
 
 ```mermaid
----
-config:
-  layout: dagre
----
-flowchart TD
-    Start(["Start activation"]) --> Cache{"Cached token exists?"}
-    Cache -- No --> Needs["NeedsActivation"]
-    Cache -- Yes --> Local{"Locally valid?"}
-    Local -- No --> Needs
-    Local -- Yes --> Method{"Activation method"}
-    Method -- Offline --> Trial
-    Method -- Online --> Refresh{"Inside refresh and expiration thresholds?"}
-    Refresh -- Yes --> Trial
-    Refresh -- No --> Provisional{"Inside expiration threshold?"}
-    Provisional -- Yes --> Cached["Cached"]
-    Provisional -- No --> Validate
-    Cached --> Validate{"Live validation result"}
-    Validate -- Valid --> Trial{"Trial?"}
-    Validate -- Definitively rejected --> Remove["Remove cached token"] --> Needs
-    Validate -- Transient failure --> Age{"Inside expiration threshold?"}
-    Age -- "Yes: keep access and retry" --> Validate
-    Age -- "No: RefreshFailed" --> Needs
-    Needs --> Request["Request online activation URL"]
-    Request --> Choice{"Activation method"}
-    Choice -- User provides offline token --> Offline{"Offline token valid?"}
-    Offline -- Invalid --> Error["Error: offline token invalid"]
-    Offline -- Valid --> Confirmed
-    Choice -- User opens browser --> Poll{"Token active online?"}
-    Poll -- No --> Poll
-    Poll -- Yes --> Trial
-    Trial -- No --> Confirmed["Confirmed"]
-    Trial -- Yes --> PendingTrial["Cached"]
-    PendingTrial --> Prefetch["Fetch follow-up activation URL"]
-    Prefetch --> TrialUrl["Trial(URL)"]
-    TrialUrl --> Choice
-     Cached:::state
-     Confirmed:::state
-     PendingTrial:::state
-     TrialUrl:::state
-     Error:::err
-    classDef state fill:#eef,stroke:#88f,color:#003
-    classDef err fill:#fee,stroke:#f88,color:#700
+flowchart LR
+    Start([Start]) --> Check{Check cached token}
+
+    Check -- "None or invalid" --> Needs[NeedsActivation]
+    Check -- Provisional --> Cached[Cached]
+    Check -- Confirmed --> Confirmed[Confirmed]
+
+    Needs -- "Trial accepted" --> Cached
+    Cached -- "Trial URL ready" --> Trial[Trial]
+    Trial -- Purchased --> Confirmed
+
+    Needs -- Purchased --> Confirmed
+    Cached -- "Purchase validated" --> Confirmed
+    Cached -. "Rejected or expired" .-> Needs
 ```
