@@ -1,4 +1,5 @@
 # moonbase-licensing
+
 [![Crates.io](https://img.shields.io/crates/v/moonbase-licensing.svg)](https://crates.io/crates/moonbase-licensing)
 [![Docs.rs](https://img.shields.io/docsrs/moonbase-licensing)](https://docs.rs/moonbase-licensing)
 
@@ -22,39 +23,37 @@ The usage is simple: spawn a `LicenseActivator`, call `poll`, and read from the 
 updating your UI and internal state in response.
 
 ```rust
+use moonbase_licensing::{ActivationState, LicenseActivator};
+
 // on application startup, spawn the license activator:
 let config = /* ... configuration ... */;
 let mut activator = LicenseActivator::spawn(config);
 
 // then fetch status and errors regularly, for example on your UI thread:
 if let Some(activation_state) = activator.poll() {
+    // `activation_state.grants_access()` reports whether the state
+    // grants the user access to the software, i.e. whether it isn't `NeedsActivation`
     match activation_state {
         ActivationState::NeedsActivation(activation_url_browser) => {
+            // revoke access if it was provisionally granted by ActivationState::Cached
             // update GUI accordingly - if activation_url_browser is provided,
             // you can direct the user to open it in the browser,
             // if it is None, only offline activation is available at this point
         }
-        ActivationState::Activated {
-            claims,
-            online_activation_url,
-        } => {
-            // activation has been successful - grant access and store the claims
-            // (username, whether it's a trial, etc) somewhere for later use
-            if claims.trial {
-                // if the activation was a trial activation,
-                // you can give the user the option to
-                // go through the activation flow again
-                // to install their real license.
-
-                if let Some(url) = online_activation_url {
-                    // the URL for follow-up online activation checks.
-                }
-            } else {
-                // a non-trial activation finishes the activator's flow.
-                // poll will not return any more activation states.
-            }
+        ActivationState::Cached(claims) => {
+            // grant provisional access immediately and keep polling -
+            // online validation may confirm or revoke this activation
+        }
+        ActivationState::Confirmed(claims) => {
+            // activation has been confirmed - grant access and stop polling
+        }
+        ActivationState::Trial(claims, followup_online_activation_url) => {
+            // a trial activation grants access and provides the URL
+            // to install a purchased license - keep polling
         }
     }
+
+    // store claims (username, product version, etc.) as needed
 }
 
 while let Ok(error) = activator.error_recv.try_recv() {
@@ -81,17 +80,35 @@ There are two age thresholds to supply to `LicenseActivator` to configure these 
   are accepted without attempting online validation to log the user in instantly and preserve API quotas.
 - `online_token_expiration_threshold` is the age after which an online token is deemed expired if it can't be refreshed.
   Younger tokens are accepted even if they can't be refreshed online, to give the user the benefit of the doubt and
-  allow them to keep using the software if they have temporary connectivity issues.  
+  allow them to keep using the software if they have temporary connectivity issues.
   Be careful not to set this value too high - users may take a device offline
   and keep using the software, even if the key has been retransferred to another device in the meantime,
   thus allowing them to exceed the limit of registered devices until the threshold is exceeded.
 
+The expiration threshold is always the hard limit for accepting a token without online validation,
+even if the refresh threshold is configured to be longer.
+
 Sensible default values are 1 and 20 days, respectively.
+
+When online validation is attempted, a cached token must first pass local signature,
+product, device, and expiration checks. The activator then emits
+`Cached(claims)` immediately, so the application can grant
+provisional access without waiting for the network. Afterwards, keep polling:
+successful validation upgrades the state to `Confirmed(claims)`,
+or to `Trial(claims, url)` with an URL for follow-up online license activation.
+
+`Cached` is provisional (i.e. locally valid but not yet validated against Moonbase) and can be revoked.
+A definitive rejection from Moonbase deletes the cached token and emits `NeedsActivation` immediately.
+For any other issues validating, such as missing internet connection, we retry
+but give the user the benefit of the doubt by not revoking the token until `online_token_expiration_threshold` is reached.
 
 ## Offline token expiration
 
-Tokens created via **Offline** activation cannot be revoked,
-and are therefore valid forever unless the machine's device signature changes.
+Tokens created via **Offline** activation cannot be revoked and do not require a
+Moonbase API check. A locally valid non-trial offline token emits
+`Confirmed` immediately. An offline trial first emits `Cached` while
+its follow-up URL is fetched, then `Trial(claims, url)`. Offline tokens remain valid until
+their signed expiration, if any, and only on the device whose signature they contain.
 
 ## Flow
 
@@ -103,25 +120,40 @@ config:
   layout: dagre
 ---
 flowchart TD
-    Start(["Start Activation"]) --> Cache{"Cached token exists?"}
-    Cache -- No --> Needs["Needs Activation"]
-    Cache -- Yes --> Activated["Activated"]
+    Start(["Start activation"]) --> Cache{"Cached token exists?"}
+    Cache -- No --> Needs["NeedsActivation"]
+    Cache -- Yes --> Local{"Locally valid?"}
+    Local -- No --> Needs
+    Local -- Yes --> Method{"Activation method"}
+    Method -- Offline --> Trial
+    Method -- Online --> Refresh{"Inside refresh and expiration thresholds?"}
+    Refresh -- Yes --> Trial
+    Refresh -- No --> Provisional{"Inside expiration threshold?"}
+    Provisional -- Yes --> Cached["Cached"]
+    Provisional -- No --> Validate
+    Cached --> Validate{"Live validation result"}
+    Validate -- Valid --> Trial{"Trial?"}
+    Validate -- Definitively rejected --> Remove["Remove cached token"] --> Needs
+    Validate -- Transient failure --> Age{"Inside expiration threshold?"}
+    Age -- "Yes: keep access and retry" --> Validate
+    Age -- "No: RefreshFailed" --> Needs
     Needs --> Request["Request online activation URL"]
     Request --> Choice{"Activation method"}
     Choice -- User provides offline token --> Offline{"Offline token valid?"}
-    Offline -- Invalid --> Error["Error: Offline token invalid"]
-    Offline -- Valid --> Paid
+    Offline -- Invalid --> Error["Error: offline token invalid"]
+    Offline -- Valid --> Confirmed
     Choice -- User opens browser --> Poll{"Token active online?"}
     Poll -- No --> Poll
-    Poll -- Yes --> Activated
-    Activated --> Trial{"Trial?"}
-    Trial -- No --> Paid["Activated (purchased)"]
-    Trial -- Yes --> Prefetch
-    Prefetch["Prefetch next online activation URL"] --> TrialUrl["Activated (trial, purchase URL)"]
+    Poll -- Yes --> Trial
+    Trial -- No --> Confirmed["Confirmed"]
+    Trial -- Yes --> PendingTrial["Cached"]
+    PendingTrial --> Prefetch["Fetch follow-up activation URL"]
+    Prefetch --> TrialUrl["Trial(URL)"]
     TrialUrl --> Choice
-     Activated:::state
+     Cached:::state
+     Confirmed:::state
+     PendingTrial:::state
      TrialUrl:::state
-     Paid:::state
      Error:::err
     classDef state fill:#eef,stroke:#88f,color:#003
     classDef err fill:#fee,stroke:#f88,color:#700
