@@ -2,9 +2,7 @@ use anyhow::{Context, Result};
 use console::style;
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 use indicatif::{ProgressBar, ProgressStyle};
-use moonbase_licensing::{
-    ActivationState, ActivationType, LicenseActivationConfig, LicenseActivator,
-};
+use moonbase_licensing::{ActivationState, LicenseActivationConfig, LicenseActivator};
 use std::env;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
@@ -42,62 +40,60 @@ fn run_activation(activator: &mut LicenseActivator) -> Result<()> {
 
     loop {
         match activator.poll() {
-            Some(ActivationState::Activated(claims, activation_type)) => match activation_type {
-                ActivationType::Cached => {
-                    if !provisional_active {
-                        spinner.finish_and_clear();
-                        println!(
-                            "\n{} License grants provisional access!",
-                            style("✓").green().bold()
-                        );
-                        print_license_details(&claims);
-                        provisional_active = true;
-                    }
-
-                    activation_url = None;
-                    user_chose_method = false;
-                    spinner.set_message(if claims.trial {
-                        "Requesting follow-up activation URL..."
-                    } else {
-                        "Confirming cached license online..."
-                    });
-                    spinner.enable_steady_tick(Duration::from_millis(100));
-                }
-                ActivationType::Confirmed => {
+            Some(ActivationState::Cached(claims)) => {
+                if !provisional_active {
                     spinner.finish_and_clear();
                     println!(
-                        "\n{} License activated successfully!",
+                        "\n{} License grants provisional access!",
                         style("✓").green().bold()
                     );
                     print_license_details(&claims);
-                    break;
+                    provisional_active = true;
                 }
-                ActivationType::Trial(url) => {
-                    provisional_active = false;
-                    if !trial_active {
-                        spinner.finish_and_clear();
-                        println!(
-                            "\n{} Trial activated successfully!",
-                            style("✓").green().bold()
-                        );
-                        print_license_details(&claims);
-                        trial_active = true;
-                        activation_url = None;
-                        user_chose_method = false;
-                    }
 
-                    if !user_chose_method && activation_url.as_ref() != Some(&url) {
-                        activation_url = Some(url.clone());
-                        spinner.finish_and_clear();
-                        user_chose_method = true;
-                        handle_activation_options(&url, activator)?;
-
-                        // Restart spinner after user interaction
-                        spinner.set_message("Waiting for purchased activation...");
-                        spinner.enable_steady_tick(Duration::from_millis(100));
-                    }
+                activation_url = None;
+                user_chose_method = false;
+                spinner.set_message(if claims.trial {
+                    "Requesting follow-up activation URL..."
+                } else {
+                    "Confirming cached license online..."
+                });
+                spinner.enable_steady_tick(Duration::from_millis(100));
+            }
+            Some(ActivationState::Confirmed(claims)) => {
+                spinner.finish_and_clear();
+                println!(
+                    "\n{} License activated successfully!",
+                    style("✓").green().bold()
+                );
+                print_license_details(&claims);
+                break;
+            }
+            Some(ActivationState::Trial(claims, url)) => {
+                provisional_active = false;
+                if !trial_active {
+                    spinner.finish_and_clear();
+                    println!(
+                        "\n{} Trial activated successfully!",
+                        style("✓").green().bold()
+                    );
+                    print_license_details(&claims);
+                    trial_active = true;
+                    activation_url = None;
+                    user_chose_method = false;
                 }
-            },
+
+                if !user_chose_method && activation_url.as_ref() != Some(&url) {
+                    activation_url = Some(url.clone());
+                    spinner.finish_and_clear();
+                    user_chose_method = true;
+                    handle_activation_options(&url, activator)?;
+
+                    // Restart spinner after user interaction
+                    spinner.set_message("Waiting for purchased activation...");
+                    spinner.enable_steady_tick(Duration::from_millis(100));
+                }
+            }
             Some(ActivationState::NeedsActivation(online_activation_url)) => {
                 if provisional_active {
                     spinner.finish_and_clear();

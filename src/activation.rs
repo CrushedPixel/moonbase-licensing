@@ -25,35 +25,39 @@ pub enum ActivationState {
     /// but online activation may become available later with a new [ActivationState].
     NeedsActivation(Option<String>),
 
-    /// The plugin has been successfully activated.
-    ///
-    /// The [ActivationType] indicates how to proceed.
-    Activated(LicenseTokenClaims, ActivationType),
-}
-
-/// Describes the type of activation.
-pub enum ActivationType {
-    /// The activation grants provisional access while background work continues.
+    /// The plugin has been activated provisionally,
+    /// granting access while background work continues.
     ///
     /// This is emitted for a locally valid cached online token before Moonbase
     /// confirms it, and for a newly accepted trial while its follow-up URL is fetched.
     ///
-    /// This may be followed by [ActivationType::Confirmed],
-    /// [ActivationType::Trial], or [ActivationState::NeedsActivation].
-    Cached,
+    /// This may be followed by [ActivationState::Confirmed],
+    /// [ActivationState::Trial], or [ActivationState::NeedsActivation].
+    Cached(LicenseTokenClaims),
 
-    /// A trial license has been validated.
+    /// The plugin has been activated using a trial license.
     ///
     /// The given URL can be opened in the user's browser
     /// to perform another online activation
     /// and replace the trial with a purchased license.
-    Trial(String),
+    Trial(LicenseTokenClaims, String),
 
-    /// A non-trial license has been successfully activated.
+    /// The plugin has been successfully activated using a non-trial license.
     ///
     /// This finishes the activation flow.
     /// No more states will be emitted after this.
-    Confirmed,
+    Confirmed(LicenseTokenClaims),
+}
+
+impl ActivationState {
+    /// Returns whether this state grants the user access to the software.
+    ///
+    /// This is the case for every state except [ActivationState::NeedsActivation].
+    /// Note that the access granted by [ActivationState::Cached] is provisional
+    /// and may be revoked by a subsequent state.
+    pub fn grants_access(&self) -> bool {
+        !matches!(self, ActivationState::NeedsActivation(_))
+    }
 }
 
 /// Errors that can occur during the activation process.
@@ -301,11 +305,11 @@ impl LicenseActivator {
     /// Until the first value is returned, the license activation state is undetermined,
     /// and the user should just be shown a "loading" state.
     ///
-    /// [ActivationType::Cached] grants provisional access while background work continues.
-    /// It may be followed by [ActivationType::Confirmed], [ActivationType::Trial],
+    /// [ActivationState::Cached] grants provisional access while background work continues.
+    /// It may be followed by [ActivationState::Confirmed], [ActivationState::Trial],
     /// or [ActivationState::NeedsActivation] if online validation fails.
     ///
-    /// After a non-trial activation, indicated by [ActivationType::Confirmed],
+    /// After a non-trial activation, indicated by [ActivationState::Confirmed],
     /// the activator stops and you can stop polling.
     pub fn poll(&mut self) -> Option<ActivationState> {
         if self.activation_finished {
@@ -322,10 +326,7 @@ impl LicenseActivator {
                 token_to_save = Some(new_token);
             }
 
-            if matches!(
-                &state,
-                ActivationState::Activated(_, ActivationType::Confirmed)
-            ) {
+            if matches!(&state, ActivationState::Confirmed(_)) {
                 self.activation_finished = true;
                 latest_state = Some(state);
                 break;
@@ -357,17 +358,16 @@ impl LicenseActivator {
     pub fn submit_offline_activation_token(&mut self, token: &str) {
         match self.check_offline_activation_token(token) {
             Ok(claims) => {
-                let activation_type = if claims.trial {
+                let state = if claims.trial {
                     self.poll_online_activation.store(false, Ordering::Relaxed);
-                    ActivationType::Cached
+                    ActivationState::Cached(claims)
                 } else {
-                    ActivationType::Confirmed
+                    ActivationState::Confirmed(claims)
                 };
                 if publish_activation(
                     &self.running,
                     &self.state_send,
-                    claims,
-                    activation_type,
+                    state,
                     Some(token.to_string()),
                 ) {
                     // interrupt the worker's timed wait so it can stop immediately
@@ -421,19 +421,13 @@ fn worker_thread(
     match cached_result {
         Ok(CachedTokenCheckOutcome::Accepted(result)) => {
             let claims = result.claims;
-            let activation_type = if claims.trial {
-                ActivationType::Cached
+            let state = if claims.trial {
+                ActivationState::Cached(claims.clone())
             } else {
-                ActivationType::Confirmed
+                ActivationState::Confirmed(claims.clone())
             };
 
-            if !publish_activation(
-                &running,
-                &state_send,
-                claims.clone(),
-                activation_type,
-                Some(result.token),
-            ) {
+            if !publish_activation(&running, &state_send, state, Some(result.token)) {
                 return;
             }
 
@@ -486,8 +480,7 @@ fn worker_thread(
                     if !publish_activation(
                         &running,
                         &state_send,
-                        claims.clone(),
-                        ActivationType::Trial(urls.browser.clone()),
+                        ActivationState::Trial(claims.clone(), urls.browser.clone()),
                         None,
                     ) {
                         return;
@@ -532,22 +525,16 @@ fn worker_thread(
                 match activation_result {
                     Ok(Some((token, claims))) => {
                         // the software has been activated!
-                        let activation_type = if claims.trial {
-                            ActivationType::Cached
+                        let state = if claims.trial {
+                            ActivationState::Cached(claims.clone())
                         } else {
-                            ActivationType::Confirmed
+                            ActivationState::Confirmed(claims.clone())
                         };
                         if claims.trial {
                             // the next online result must not be polled until explicitly enabled
                             poll_online_activation.store(false, Ordering::Relaxed);
                         }
-                        if !publish_activation(
-                            &running,
-                            &state_send,
-                            claims.clone(),
-                            activation_type,
-                            Some(token),
-                        ) {
+                        if !publish_activation(&running, &state_send, state, Some(token)) {
                             return;
                         }
 
@@ -580,23 +567,17 @@ fn worker_thread(
                 match cached_result {
                     Ok(CachedTokenCheckOutcome::Accepted(result)) => {
                         let claims = result.claims;
-                        let activation_type = if claims.trial {
-                            ActivationType::Cached
+                        let state = if claims.trial {
+                            ActivationState::Cached(claims.clone())
                         } else {
-                            ActivationType::Confirmed
+                            ActivationState::Confirmed(claims.clone())
                         };
                         if claims.trial {
                             // the next online result must not be polled until explicitly enabled
                             poll_online_activation.store(false, Ordering::Relaxed);
                         }
 
-                        if !publish_activation(
-                            &running,
-                            &state_send,
-                            claims.clone(),
-                            activation_type,
-                            Some(result.token),
-                        ) {
+                        if !publish_activation(&running, &state_send, state, Some(result.token)) {
                             return;
                         }
 
@@ -654,16 +635,15 @@ fn worker_thread(
 fn publish_activation(
     running: &AtomicBool,
     state_send: &Sender<(ActivationState, Option<String>)>,
-    claims: LicenseTokenClaims,
-    activation_type: ActivationType,
+    state: ActivationState,
     new_token: Option<String>,
 ) -> bool {
     debug_assert!(
-        !matches!(&activation_type, ActivationType::Confirmed) || new_token.is_some(),
+        !matches!(&state, ActivationState::Confirmed(_)) || new_token.is_some(),
         "confirmed activations must persist their accepted token"
     );
 
-    if matches!(&activation_type, ActivationType::Confirmed) {
+    if matches!(&state, ActivationState::Confirmed(_)) {
         if !running.swap(false, Ordering::Relaxed) {
             return false;
         }
@@ -671,12 +651,7 @@ fn publish_activation(
         return false;
     }
 
-    state_send
-        .send((
-            ActivationState::Activated(claims, activation_type),
-            new_token,
-        ))
-        .is_ok()
+    state_send.send((state, new_token)).is_ok()
 }
 
 struct CachedTokenCheckResult {
@@ -727,12 +702,10 @@ fn restored_activation_state(
     activation_urls: Option<&ActivationUrls>,
 ) -> ActivationState {
     match active_trial {
-        Some(claims) => ActivationState::Activated(
-            claims.clone(),
-            activation_urls
-                .map(|urls| ActivationType::Trial(urls.browser.clone()))
-                .unwrap_or(ActivationType::Cached),
-        ),
+        Some(claims) => match activation_urls {
+            Some(urls) => ActivationState::Trial(claims.clone(), urls.browser.clone()),
+            None => ActivationState::Cached(claims.clone()),
+        },
         None => ActivationState::NeedsActivation(activation_urls.map(|urls| urls.browser.clone())),
     }
 }
@@ -804,8 +777,7 @@ fn check_cached_token(
                             if !publish_activation(
                                 running,
                                 state_send,
-                                claims.clone(),
-                                ActivationType::Cached,
+                                ActivationState::Cached(claims.clone()),
                                 None,
                             ) {
                                 return Ok(CachedTokenCheckOutcome::NoToken {

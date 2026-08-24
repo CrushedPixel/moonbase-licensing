@@ -23,7 +23,7 @@ The usage is simple: spawn a `LicenseActivator`, call `poll`, and read from the 
 updating your UI and internal state in response.
 
 ```rust
-use moonbase_licensing::{ActivationState, ActivationType, LicenseActivator};
+use moonbase_licensing::{ActivationState, LicenseActivator};
 
 // on application startup, spawn the license activator:
 let config = /* ... configuration ... */;
@@ -31,31 +31,29 @@ let mut activator = LicenseActivator::spawn(config);
 
 // then fetch status and errors regularly, for example on your UI thread:
 if let Some(activation_state) = activator.poll() {
+    // `activation_state.grants_access()` reports whether the state
+    // grants the user access to the software, i.e. whether it isn't `NeedsActivation`
     match activation_state {
         ActivationState::NeedsActivation(activation_url_browser) => {
-            // revoke access if it was provisionally granted by ActivationType::Cached
+            // revoke access if it was provisionally granted by ActivationState::Cached
             // update GUI accordingly - if activation_url_browser is provided,
             // you can direct the user to open it in the browser,
             // if it is None, only offline activation is available at this point
         }
-        ActivationState::Activated(claims, activation_type) => {
-            match activation_type {
-                ActivationType::Cached => {
-                    // grant provisional access immediately and keep polling -
-                    // online validation may confirm or revoke this activation
-                }
-                ActivationType::Confirmed => {
-                    // activation has been confirmed - grant access and stop polling
-                }
-                ActivationType::Trial(followup_online_activation_url) => {
-                    // a trial activation grants access and provides the URL
-                    // to install a purchased license - keep polling
-                }
-            }
-
-            // store claims (username, product version, etc.) as needed
+        ActivationState::Cached(claims) => {
+            // grant provisional access immediately and keep polling -
+            // online validation may confirm or revoke this activation
+        }
+        ActivationState::Confirmed(claims) => {
+            // activation has been confirmed - grant access and stop polling
+        }
+        ActivationState::Trial(claims, followup_online_activation_url) => {
+            // a trial activation grants access and provides the URL
+            // to install a purchased license - keep polling
         }
     }
+
+    // store claims (username, product version, etc.) as needed
 }
 
 while let Ok(error) = activator.error_recv.try_recv() {
@@ -94,12 +92,12 @@ Sensible default values are 1 and 20 days, respectively.
 
 When online validation is attempted, a cached token must first pass local signature,
 product, device, and expiration checks. The activator then emits
-`Activated(claims, ActivationType::Cached)` immediately, so the application can grant
+`Cached(claims)` immediately, so the application can grant
 provisional access without waiting for the network. Afterwards, keep polling:
-successful validation upgrades the state to `ActivationType::Confirmed`,
-or to `ActivationType::Trial(url)` with an URL for follow-up online license activation.
+successful validation upgrades the state to `Confirmed(claims)`,
+or to `Trial(claims, url)` with an URL for follow-up online license activation.
 
-`ActivationType::Cached` is provisional (i.e. locally valid but not yet validated against Moonbase) and can be revoked.
+`Cached` is provisional (i.e. locally valid but not yet validated against Moonbase) and can be revoked.
 A definitive rejection from Moonbase deletes the cached token and emits `NeedsActivation` immediately.
 For any other issues validating, such as missing internet connection, we retry
 but give the user the benefit of the doubt by not revoking the token until `online_token_expiration_threshold` is reached.
@@ -108,8 +106,8 @@ but give the user the benefit of the doubt by not revoking the token until `onli
 
 Tokens created via **Offline** activation cannot be revoked and do not require a
 Moonbase API check. A locally valid non-trial offline token emits
-`ActivationType::Confirmed` immediately. An offline trial first emits `Cached` while
-its follow-up URL is fetched, then `Trial(url)`. Offline tokens remain valid until
+`Confirmed` immediately. An offline trial first emits `Cached` while
+its follow-up URL is fetched, then `Trial(claims, url)`. Offline tokens remain valid until
 their signed expiration, if any, and only on the device whose signature they contain.
 
 ## Flow
@@ -131,7 +129,7 @@ flowchart TD
     Method -- Online --> Refresh{"Inside refresh and expiration thresholds?"}
     Refresh -- Yes --> Trial
     Refresh -- No --> Provisional{"Inside expiration threshold?"}
-    Provisional -- Yes --> Cached["Activated: Cached"]
+    Provisional -- Yes --> Cached["Cached"]
     Provisional -- No --> Validate
     Cached --> Validate{"Live validation result"}
     Validate -- Valid --> Trial{"Trial?"}
@@ -147,10 +145,10 @@ flowchart TD
     Choice -- User opens browser --> Poll{"Token active online?"}
     Poll -- No --> Poll
     Poll -- Yes --> Trial
-    Trial -- No --> Confirmed["Activated: Confirmed"]
-    Trial -- Yes --> PendingTrial["Activated: Cached"]
+    Trial -- No --> Confirmed["Confirmed"]
+    Trial -- Yes --> PendingTrial["Cached"]
     PendingTrial --> Prefetch["Fetch follow-up activation URL"]
-    Prefetch --> TrialUrl["Activated: Trial(URL)"]
+    Prefetch --> TrialUrl["Trial(URL)"]
     TrialUrl --> Choice
      Cached:::state
      Confirmed:::state
