@@ -9,7 +9,8 @@ Moonbase products that are free (not licensed).
 
 - Call `LicenseActivator::poll()` to get state updates.
   `LicenseActivator::state_recv` is no longer public. `poll()` returns the latest
-  state and saves accepted tokens.
+  state, which the activator has already cached.
+- The minimum supported Rust version is 1.89.
 - `ActivationState::Activated` has been replaced by:
   - `Cached(claims)`: Grants provisional access while work continues.
   - `Trial(claims, followup_online_activation_url)`: Grants trial access and
@@ -42,5 +43,9 @@ Moonbase products that are free (not licensed).
 - Online and offline trials now provide a follow-up online activation URL.
 - `poll_online_activation` is set to false after installing a trial. Set it to
   true again when the follow-up URL is opened.
-- One application instance no longer overwrites a newer token saved by another
-  instance.
+- Instances sharing a token cache coordinate across threads and processes. Only
+  one of them refreshes a token at a time, accepted tokens are cached before
+  their state is published, and a slow refresh or a rejection no longer
+  overwrites or deletes a license installed in the meantime.
+- Simultaneous `check_for_update()` calls sharing a `cache_path` result in a
+  single request, and the ones arriving while it is in flight return its result.

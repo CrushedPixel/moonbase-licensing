@@ -1,4 +1,5 @@
 use crate::api::{moonbase_agent, moonbase_api_base_url};
+use crate::cache;
 use crate::claims::{ActivationMethod, LicenseTokenClaims};
 use crate::device_token::DeviceToken;
 use crate::notification::{NotifyingSender, notifying_channel};
@@ -8,9 +9,9 @@ use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, get_current_timestamp};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
 use std::thread::{JoinHandle, Thread};
 use std::time::Duration;
 use std::{fs, io, thread};
@@ -170,6 +171,9 @@ pub struct LicenseActivationConfig {
     pub jwt_pubkey: String,
 
     /// The path where the cached license token payload is stored on disk.
+    /// Instances sharing this path coordinate token refreshes among each other.
+    /// Its parent directory must exist and be writable
+    /// for caching and that coordination to take effect.
     pub cached_token_path: PathBuf,
 
     /// User-friendly display name of the device the software is running on.
@@ -191,13 +195,10 @@ pub struct LicenseActivationConfig {
 pub struct LicenseActivator {
     /// Product, device, and cache configuration for activation.
     cfg: LicenseActivationConfig,
-    /// Used to serialize cache writes and conditional removal.
-    cache_io: Arc<Mutex<()>>,
-
-    /// Receiver for activation states and any accepted token that must be cached.
-    state_recv: Receiver<(ActivationState, Option<String>)>,
+    /// Receiver for activation states, which are published once their token is cached.
+    state_recv: Receiver<ActivationState>,
     /// Sender used to publish directly submitted offline activations.
-    state_send: NotifyingSender<(ActivationState, Option<String>)>,
+    state_send: NotifyingSender<ActivationState>,
     /// Whether a purchased activation has already been returned by [Self::poll].
     activation_finished: bool,
 
@@ -207,7 +208,7 @@ pub struct LicenseActivator {
     /// You may want to display only the most recent error,
     /// or perhaps display each error and make them dismissable.
     pub error_recv: Receiver<ActivationError>,
-    /// Sender for errors encountered while polling or submitting an offline token.
+    /// Sender for errors encountered while submitting an offline token.
     error_send: NotifyingSender<ActivationError>,
 
     /// While this is true, the license activator polls the Moonbase API
@@ -272,8 +273,6 @@ impl LicenseActivator {
 
         let state_send_clone = state_send.clone();
         let error_send_clone = error_send.clone();
-        let cache_io = Arc::new(Mutex::new(()));
-        let cache_io_clone = cache_io.clone();
         let cfg_clone = cfg.clone();
 
         let join = thread::spawn(|| {
@@ -281,7 +280,6 @@ impl LicenseActivator {
                 running_clone,
                 state_send_clone,
                 error_send_clone,
-                cache_io_clone,
                 poll_online_activation_clone,
                 cfg_clone,
             );
@@ -291,8 +289,6 @@ impl LicenseActivator {
 
         Self {
             cfg,
-            cache_io,
-
             state_recv,
             state_send,
             activation_finished: false,
@@ -329,21 +325,18 @@ impl LicenseActivator {
     ///
     /// After a non-trial activation, indicated by [ActivationState::Confirmed],
     /// the activator stops and you can stop polling.
+    ///
+    /// This only returns states the activator has already published,
+    /// so it accesses neither the disk nor the network.
     pub fn poll(&mut self) -> Option<ActivationState> {
         if self.activation_finished {
             return None;
         }
 
         let mut latest_state = None;
-        let mut token_to_save = None;
 
         // drain updates so the caller receives only most recent state
-        while let Ok((state, new_token)) = self.state_recv.try_recv() {
-            // don't discard a token queued by an earlier state update
-            if let Some(new_token) = new_token {
-                token_to_save = Some(new_token);
-            }
-
+        while let Ok(state) = self.state_recv.try_recv() {
             if matches!(&state, ActivationState::Confirmed(_)) {
                 self.activation_finished = true;
                 latest_state = Some(state);
@@ -353,26 +346,17 @@ impl LicenseActivator {
             latest_state = Some(state);
         }
 
-        if let Some(token) = token_to_save {
-            let _cache_guard = self
-                .cache_io
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            if let Err(error) = fs::write(&self.cfg.cached_token_path, token) {
-                _ = self
-                    .error_send
-                    .send(ActivationError::SaveCachedToken(error));
-            }
-        }
-
         latest_state
     }
 
     /// Submits the given offline activation token for validation,
-    /// queuing it to be cached if it's valid.
+    /// caching it on disk if it's valid.
     ///
     /// The result of the validation can be obtained
     /// by polling activation states and errors as usual.
+    ///
+    /// This call blocks while validating the token and writing it to disk,
+    /// so it should not be made on a UI thread.
     pub fn submit_offline_activation_token(&mut self, token: &str) {
         match self.check_offline_activation_token(token) {
             Ok(claims) => {
@@ -383,8 +367,10 @@ impl LicenseActivator {
                     ActivationState::Confirmed(claims)
                 };
                 if publish_activation(
+                    &self.cfg,
                     &self.running,
                     &self.state_send,
+                    &self.error_send,
                     state,
                     Some(token.to_string()),
                 ) {
@@ -421,31 +407,29 @@ impl LicenseActivationConfig {
 
 fn worker_thread(
     running: Arc<AtomicBool>,
-    state_send: NotifyingSender<(ActivationState, Option<String>)>,
+    state_send: NotifyingSender<ActivationState>,
     error_send: NotifyingSender<ActivationError>,
-    cache_io: Arc<Mutex<()>>,
     poll_online_activation: Arc<AtomicBool>,
     cfg: LicenseActivationConfig,
 ) {
     let mut active_trial = None;
 
     // first, try to load a cached license token from disk
-    let cached_result = check_cached_token(&cfg, &running, &state_send, false);
+    let cached_result = check_cached_token(&cfg, &running, &state_send, &error_send, false);
 
     if !running.load(Ordering::Relaxed) {
         return;
     }
 
     match cached_result {
-        Ok(CachedTokenCheckOutcome::Accepted(result)) => {
-            let claims = result.claims;
+        Ok(CachedTokenCheckOutcome::Accepted(claims)) => {
             let state = if claims.trial {
                 ActivationState::Cached(claims.clone())
             } else {
                 ActivationState::Confirmed(claims.clone())
             };
 
-            if !publish_activation(&running, &state_send, state, Some(result.token)) {
+            if !publish_activation(&cfg, &running, &state_send, &error_send, state, None) {
                 return;
             }
 
@@ -461,9 +445,9 @@ fn worker_thread(
         Ok(CachedTokenCheckOutcome::NoToken { .. }) => {
             // no cached token was found
         }
-        Err(failure) => {
+        Err(error) => {
             // cached token couldn't be validated
-            report_cached_token_failure(&cache_io, &cfg.cached_token_path, &error_send, failure);
+            report_cached_token_failure(&error_send, error);
         }
     }
 
@@ -473,10 +457,17 @@ fn worker_thread(
 
         // we don't yet have a URL to provide for online activation,
         // but we can supply that in a subsequent state update.
-        _ = state_send.send((ActivationState::NeedsActivation(None), None));
+        _ = state_send.send(ActivationState::NeedsActivation(None));
     }
 
     'request_url: while running.load(Ordering::Relaxed) {
+        // remember the currently cached token, if any -
+        // while the user activates the software in their browser,
+        // another instance may install a license that we mustn't overwrite
+        let token_before_activation = read_cached_token_file(&cfg.cached_token_path)
+            .ok()
+            .flatten();
+
         // ask Moonbase for the endpoints to perform online activation
         let requested_urls = (|| moonbase_request_online_activation(&cfg))
             .retry(
@@ -496,8 +487,10 @@ fn worker_thread(
                 // we got the URLs for online activation
                 if let Some(claims) = active_trial.as_ref() {
                     if !publish_activation(
+                        &cfg,
                         &running,
                         &state_send,
+                        &error_send,
                         ActivationState::Trial(claims.clone(), urls.browser.clone()),
                         None,
                     ) {
@@ -505,10 +498,8 @@ fn worker_thread(
                     }
                 } else {
                     // send the user-facing activation URL to the main thread
-                    _ = state_send.send((
-                        ActivationState::NeedsActivation(Some(urls.browser.clone())),
-                        None,
-                    ));
+                    _ = state_send
+                        .send(ActivationState::NeedsActivation(Some(urls.browser.clone())));
                 }
                 Some(urls)
             }
@@ -542,6 +533,27 @@ fn worker_thread(
 
                 match activation_result {
                     Ok(Some((token, claims))) => {
+                        // cache the token before announcing the activation,
+                        // so that other instances can discover it right away
+                        match replace_cached_token_if_matches(
+                            &cfg.cached_token_path,
+                            token_before_activation.as_deref(),
+                            &token,
+                            &running,
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                // another instance has installed a license in the meantime -
+                                // stop polling and let the next cache check pick it up
+                                poll_online_activation.store(false, Ordering::Relaxed);
+                                continue;
+                            }
+                            Err(error) => {
+                                // the token couldn't be cached, but it's valid,
+                                // so we still grant access for this session
+                                _ = error_send.send(ActivationError::SaveCachedToken(error));
+                            }
+                        }
                         // the software has been activated!
                         let state = if claims.trial {
                             ActivationState::Cached(claims.clone())
@@ -552,7 +564,14 @@ fn worker_thread(
                             // the next online result must not be polled until explicitly enabled
                             poll_online_activation.store(false, Ordering::Relaxed);
                         }
-                        if !publish_activation(&running, &state_send, state, Some(token)) {
+                        if !publish_activation(
+                            &cfg,
+                            &running,
+                            &state_send,
+                            &error_send,
+                            state,
+                            None,
+                        ) {
                             return;
                         }
 
@@ -575,16 +594,20 @@ fn worker_thread(
             } else {
                 // if the user isn't currently attempting to activate the plugin in this plugin instance,
                 // check if another instance of the software has activated the plugin in the meantime
-                let cached_result =
-                    check_cached_token(&cfg, &running, &state_send, active_trial.is_some());
+                let cached_result = check_cached_token(
+                    &cfg,
+                    &running,
+                    &state_send,
+                    &error_send,
+                    active_trial.is_some(),
+                );
 
                 if !running.load(Ordering::Relaxed) {
                     return;
                 }
 
                 match cached_result {
-                    Ok(CachedTokenCheckOutcome::Accepted(result)) => {
-                        let claims = result.claims;
+                    Ok(CachedTokenCheckOutcome::Accepted(claims)) => {
                         let state = if claims.trial {
                             ActivationState::Cached(claims.clone())
                         } else {
@@ -595,7 +618,14 @@ fn worker_thread(
                             poll_online_activation.store(false, Ordering::Relaxed);
                         }
 
-                        if !publish_activation(&running, &state_send, state, Some(result.token)) {
+                        if !publish_activation(
+                            &cfg,
+                            &running,
+                            &state_send,
+                            &error_send,
+                            state,
+                            None,
+                        ) {
                             return;
                         }
 
@@ -611,31 +641,20 @@ fn worker_thread(
                     Ok(CachedTokenCheckOutcome::NoToken {
                         provisional_activation_emitted: true,
                     }) => {
-                        _ = state_send.send((
-                            restored_activation_state(
-                                active_trial.as_ref(),
-                                activation_urls.as_ref(),
-                            ),
-                            None,
+                        _ = state_send.send(restored_activation_state(
+                            active_trial.as_ref(),
+                            activation_urls.as_ref(),
                         ));
                     }
                     Ok(CachedTokenCheckOutcome::NoToken {
                         provisional_activation_emitted: false,
                     }) => {}
-                    Err(failure) => {
-                        report_cached_token_failure(
-                            &cache_io,
-                            &cfg.cached_token_path,
-                            &error_send,
-                            failure,
-                        );
+                    Err(error) => {
+                        report_cached_token_failure(&error_send, error);
 
-                        _ = state_send.send((
-                            restored_activation_state(
-                                active_trial.as_ref(),
-                                activation_urls.as_ref(),
-                            ),
-                            None,
+                        _ = state_send.send(restored_activation_state(
+                            active_trial.as_ref(),
+                            activation_urls.as_ref(),
                         ));
                     }
                 }
@@ -649,17 +668,20 @@ fn worker_thread(
     }
 }
 
-/// Publishes an accepted activation if it wins the purchased activation race.
+/// Publishes an accepted activation if it wins the purchased activation race,
+/// caching its token before the state becomes visible to the consumer.
 fn publish_activation(
+    cfg: &LicenseActivationConfig,
     running: &AtomicBool,
-    state_send: &NotifyingSender<(ActivationState, Option<String>)>,
+    state_send: &NotifyingSender<ActivationState>,
+    error_send: &NotifyingSender<ActivationError>,
     state: ActivationState,
     new_token: Option<String>,
 ) -> bool {
-    debug_assert!(
-        !matches!(&state, ActivationState::Confirmed(_)) || new_token.is_some(),
-        "confirmed activations must persist their accepted token"
-    );
+    // hold the cache lock while deciding to publish and caching the token,
+    // so that competing offline and online activations don't interleave.
+    // it is only ever held for a file write, never for a request.
+    let cache_guard = cache::lock(&cfg.cached_token_path);
 
     if matches!(&state, ActivationState::Confirmed(_)) {
         if !running.swap(false, Ordering::Relaxed) {
@@ -669,50 +691,38 @@ fn publish_activation(
         return false;
     }
 
-    state_send.send((state, new_token)).is_ok()
-}
+    // cache the token before publishing the state, so that other instances
+    // can discover the activation even before the consumer polls it
+    let saved = match (new_token, &cache_guard) {
+        (Some(token), Ok(_)) => cache::write(&cfg.cached_token_path, token),
+        // without the lock, we can't rule out overwriting a newer token
+        (Some(_), Err(error)) => Err(io::Error::new(error.kind(), error.to_string())),
+        (None, _) => Ok(()),
+    };
 
-struct CachedTokenCheckResult {
-    /// The claims that were validated.
-    claims: LicenseTokenClaims,
-    /// The accepted token that must be cached on disk.
-    token: String,
+    // release the lock before waking the consumer,
+    // whose callback must never run while we hold it
+    drop(cache_guard);
+
+    if let Err(error) = saved {
+        _ = error_send.send(ActivationError::SaveCachedToken(error));
+    }
+    state_send.send(state).is_ok()
 }
 
 enum CachedTokenCheckOutcome {
     NoToken {
         provisional_activation_emitted: bool,
     },
-    Accepted(CachedTokenCheckResult),
+    Accepted(LicenseTokenClaims),
 }
 
-struct CachedTokenCheckFailure {
-    error: CachedTokenError,
-    rejected_token: Option<String>,
-}
-
-impl From<CachedTokenError> for CachedTokenCheckFailure {
-    fn from(error: CachedTokenError) -> Self {
-        Self {
-            error,
-            rejected_token: None,
-        }
-    }
-}
-
+/// Reports that a cached token could not be validated.
 fn report_cached_token_failure(
-    cache_io: &Mutex<()>,
-    cached_token_path: &Path,
     error_send: &NotifyingSender<ActivationError>,
-    failure: CachedTokenCheckFailure,
+    error: CachedTokenError,
 ) {
-    if let Some(rejected_token) = failure.rejected_token
-        && let Err(error) =
-            remove_cached_token_if_matches(cache_io, cached_token_path, &rejected_token)
-    {
-        _ = error_send.send(ActivationError::RemoveCachedToken(error));
-    }
-    _ = error_send.send(ActivationError::LoadCachedToken(failure.error));
+    _ = error_send.send(ActivationError::LoadCachedToken(error));
 }
 
 fn restored_activation_state(
@@ -741,12 +751,39 @@ fn restored_activation_state(
 fn check_cached_token(
     cfg: &LicenseActivationConfig,
     running: &AtomicBool,
-    state_send: &NotifyingSender<(ActivationState, Option<String>)>,
+    state_send: &NotifyingSender<ActivationState>,
+    error_send: &NotifyingSender<ActivationError>,
     ignore_trials: bool,
-) -> Result<CachedTokenCheckOutcome, CachedTokenCheckFailure> {
+) -> Result<CachedTokenCheckOutcome, CachedTokenError> {
+    check_cached_token_with(
+        cfg,
+        running,
+        state_send,
+        error_send,
+        ignore_trials,
+        |token| moonbase_refresh_token(cfg, token),
+    )
+}
+
+/// Applies the caching and refresh policy of [check_cached_token] around `refresh`.
+fn check_cached_token_with(
+    cfg: &LicenseActivationConfig,
+    running: &AtomicBool,
+    state_send: &NotifyingSender<ActivationState>,
+    error_send: &NotifyingSender<ActivationError>,
+    ignore_trials: bool,
+    refresh: impl Fn(&str) -> Result<TokenValidationResponse, MoonbaseApiError>,
+) -> Result<CachedTokenCheckOutcome, CachedTokenError> {
     let mut published_cached_token = None;
+    let refresh_path = cache::sidecar(&cfg.cached_token_path, ".refresh");
 
     loop {
+        if !running.load(Ordering::Relaxed) {
+            return Ok(CachedTokenCheckOutcome::NoToken {
+                provisional_activation_emitted: published_cached_token.is_some(),
+            });
+        }
+
         match load_cached_token(cfg) {
             Ok(Some((token, claims))) => {
                 if ignore_trials && claims.trial {
@@ -762,10 +799,7 @@ fn check_cached_token(
                         // it's an offline activated token,
                         // so it will stay valid forever.
                         // validation succeeded!
-                        return Ok(CachedTokenCheckOutcome::Accepted(CachedTokenCheckResult {
-                            claims,
-                            token,
-                        }));
+                        return Ok(CachedTokenCheckOutcome::Accepted(claims));
                     }
                     ActivationMethod::Online => {
                         // it's an online activated token,
@@ -780,10 +814,7 @@ fn check_cached_token(
                             // if the token was last validated very recently,
                             // we just accept it and don't even attempt to refresh and validate it.
                             // this minimizes API requests and waiting time for the user.
-                            return Ok(CachedTokenCheckOutcome::Accepted(CachedTokenCheckResult {
-                                claims,
-                                token,
-                            }));
+                            return Ok(CachedTokenCheckOutcome::Accepted(claims));
                         }
 
                         if cached_token_within_expiration(
@@ -793,8 +824,10 @@ fn check_cached_token(
                         ) && published_cached_token.as_ref() != Some(&token)
                         {
                             if !publish_activation(
+                                cfg,
                                 running,
                                 state_send,
+                                error_send,
                                 ActivationState::Cached(claims.clone()),
                                 None,
                             ) {
@@ -806,8 +839,44 @@ fn check_cached_token(
                             published_cached_token = Some(token.clone());
                         }
 
+                        // only one instance refreshes a token at a time.
+                        // this lock is separate from the one guarding the token file,
+                        // so the user can install an offline license
+                        // while a refresh request is in flight.
+                        let _refresh_guard = match cache::try_lock(&refresh_path) {
+                            Ok(Some(guard)) => Some(guard),
+                            Ok(None) => {
+                                // another instance is refreshing the token -
+                                // wait for its result instead of making a request ourselves
+                                if published_cached_token.is_some()
+                                    && !cached_token_within_expiration(
+                                        claims.last_validated,
+                                        cfg.online_token_expiration_threshold,
+                                        Utc::now(),
+                                    )
+                                {
+                                    // provisional access ran out while we were waiting
+                                    _ = state_send.send(ActivationState::NeedsActivation(None));
+                                    published_cached_token = None;
+                                }
+                                thread::park_timeout(Duration::from_millis(100));
+                                continue;
+                            }
+                            // if the cache can't be locked, every instance refreshes on its own
+                            Err(_) => None,
+                        };
+
+                        // start over if the token was replaced while we waited for the lock
+                        if read_cached_token_file(&cfg.cached_token_path)
+                            .map_err(CachedTokenError::from)?
+                            .as_ref()
+                            != Some(&token)
+                        {
+                            continue;
+                        }
+
                         let provisional_access = published_cached_token.as_ref() == Some(&token);
-                        let validation_result = (|| moonbase_refresh_token(cfg, &token))
+                        let validation_result = (|| refresh(&token))
                             .retry(
                                 &ExponentialBuilder::default()
                                     .with_max_delay(Duration::from_secs(5))
@@ -834,26 +903,46 @@ fn check_cached_token(
                             .map_err(CachedTokenError::from)?;
                         match validation_result {
                             Ok(TokenValidationResponse::Valid(new_token, claims)) => {
-                                if current_token.as_ref() != Some(&token)
-                                    && current_token.as_ref() != Some(&new_token)
-                                {
-                                    continue;
+                                // cache the refreshed token for the other instances
+                                match replace_cached_token_if_matches(
+                                    &cfg.cached_token_path,
+                                    Some(&token),
+                                    &new_token,
+                                    running,
+                                ) {
+                                    Ok(true) => {}
+                                    // the token we refreshed has been replaced -
+                                    // start over with the one that is cached now
+                                    Ok(false) => continue,
+                                    Err(error) => {
+                                        // the refreshed token couldn't be cached,
+                                        // but it's valid, so we accept it for this session
+                                        _ = error_send
+                                            .send(ActivationError::SaveCachedToken(error));
+                                    }
                                 }
-                                return Ok(CachedTokenCheckOutcome::Accepted(
-                                    CachedTokenCheckResult {
-                                        claims,
-                                        token: new_token,
-                                    },
-                                ));
+                                return Ok(CachedTokenCheckOutcome::Accepted(claims));
                             }
                             Ok(TokenValidationResponse::ValidationFailed(failure_type, detail)) => {
                                 if current_token.as_ref() != Some(&token) {
                                     continue;
                                 }
-                                return Err(CachedTokenCheckFailure {
-                                    error: CachedTokenError::ValidationFailed(failure_type, detail),
-                                    rejected_token: Some(token),
-                                });
+                                // Moonbase rejected the token for good, so remove it
+                                match remove_cached_token_if_matches(&cfg.cached_token_path, &token)
+                                {
+                                    Ok(true) => {}
+                                    // the rejected token has been replaced -
+                                    // start over with the one that is cached now
+                                    Ok(false) => continue,
+                                    Err(error) => {
+                                        _ = error_send
+                                            .send(ActivationError::RemoveCachedToken(error));
+                                    }
+                                }
+                                return Err(CachedTokenError::ValidationFailed(
+                                    failure_type,
+                                    detail,
+                                ));
                             }
                             Err(e) => {
                                 if current_token.as_ref() != Some(&token) {
@@ -878,7 +967,7 @@ fn check_cached_token(
                                     continue;
                                 }
 
-                                return Err(CachedTokenError::RefreshFailed(e).into());
+                                return Err(CachedTokenError::RefreshFailed(e));
                             }
                         }
                     }
@@ -889,7 +978,7 @@ fn check_cached_token(
                     provisional_activation_emitted: published_cached_token.is_some(),
                 });
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         }
     }
 }
@@ -923,16 +1012,47 @@ fn read_cached_token_file(path: &Path) -> io::Result<Option<String>> {
     }
 }
 
-fn remove_cached_token_if_matches(
-    cache_io: &Mutex<()>,
-    path: &Path,
-    rejected_token: &str,
-) -> io::Result<()> {
-    let _cache_guard = cache_io.lock().unwrap_or_else(|error| error.into_inner());
+/// Removes a cached token that Moonbase rejected, unless another instance
+/// has cached a different token in the meantime.
+///
+/// Returns whether the rejected token is gone.
+fn remove_cached_token_if_matches(path: &Path, rejected_token: &str) -> io::Result<bool> {
+    let _cache_guard = cache::lock(path)?;
     if read_cached_token_file(path)?.as_deref() == Some(rejected_token) {
         fs::remove_file(path)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Caches a token in place of the `expected` one it was obtained with,
+/// unless another instance has cached a different token in the meantime.
+///
+/// Returns whether the replacement is the cached token now.
+fn replace_cached_token_if_matches(
+    path: &Path,
+    expected: Option<&str>,
+    replacement: &str,
+    running: &AtomicBool,
+) -> io::Result<bool> {
+    let _cache_guard = cache::lock(path)?;
+
+    // don't cache a token for an activator that has been dropped in the meantime
+    if !running.load(Ordering::Relaxed) {
+        return Ok(false);
+    }
+
+    let current = read_cached_token_file(path)?;
+    if current.as_deref() == Some(replacement) {
+        // another instance has already cached this very token
+        return Ok(true);
+    }
+    if current.as_deref() != expected {
+        return Ok(false);
+    }
+
+    cache::write(path, replacement)?;
+    Ok(true)
 }
 
 /// Parses and validates a license token file on disk.

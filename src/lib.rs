@@ -1,5 +1,6 @@
 mod activation;
 mod api;
+mod cache;
 pub(crate) mod claims;
 pub(crate) mod device_token;
 mod notification;

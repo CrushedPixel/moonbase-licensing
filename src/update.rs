@@ -1,14 +1,15 @@
 //! Checks Moonbase for newer product releases without requiring a license.
 
 use crate::api::{moonbase_agent, moonbase_api_base_url};
+use crate::cache;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use ureq::http::header::RETRY_AFTER;
 use ureq::http::StatusCode;
+use ureq::http::header::RETRY_AFTER;
 
 /// Configures an update check for one product.
 #[derive(Clone, Debug)]
@@ -20,7 +21,8 @@ pub struct UpdateCheckConfig {
     /// The version of the running software, in SemVer format.
     pub current_version: String,
     /// The file used to remember the latest version and the next check time.
-    /// Its parent directory must exist for the cache to take effect.
+    /// Its parent directory must exist and be writable for the cache
+    /// and the coordination between instances to take effect.
     pub cache_path: PathBuf,
     /// The minimum time between two successful requests.
     pub check_interval: Duration,
@@ -125,22 +127,39 @@ pub fn is_newer_version(current_version: &str, latest_version: &str) -> bool {
 /// honoring the delay requested by Moonbase if rate limited.
 /// Retry delays are capped at `check_interval`.
 ///
-/// This call blocks while contacting Moonbase,
+/// Calls sharing a `cache_path` don't contact Moonbase simultaneously.
+/// The ones arriving later wait for the running check and then return its result.
+///
+/// This call blocks while waiting for another check and while contacting Moonbase,
 /// so it should not be made on a UI thread.
 pub fn check_for_update(cfg: &UpdateCheckConfig) -> UpdateCheck {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    check_with(cfg, now, || fetch_latest_version(cfg))
+    check_with(
+        cfg,
+        || {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+        },
+        || fetch_latest_version(cfg),
+    )
 }
 
 /// Applies the caching policy of [check_for_update] around `fetch`.
 fn check_with(
     cfg: &UpdateCheckConfig,
-    now: u64,
+    clock: impl Fn() -> u64,
     fetch: impl FnOnce() -> Result<Option<String>, UpdateCheckError>,
 ) -> UpdateCheck {
+    // hold the cache lock for the entire check, so that other instances
+    // starting at the same time don't contact Moonbase as well.
+    // they wait here and then read the result of this check.
+    // if the cache can't be locked, every instance checks on its own.
+    let _cache_guard = cache::lock(&cfg.cache_path).ok();
+
+    // read the clock only after the wait, as a check that completed
+    // in the meantime would otherwise look like the clock moved backwards
+    let now = clock();
     let cache = read_cache(&cfg.cache_path);
     if let Some(cache) = cache.as_ref()
         && cache.is_check_pending(now, cfg.check_interval)
@@ -151,9 +170,9 @@ fn check_with(
     let cached_version = cache.and_then(|cache| cache.latest_version);
     let failure_retry_interval = cfg.failure_retry_interval.min(cfg.check_interval);
 
-    // Claim this check before making the request, so that other instances
-    // starting at the same time don't contact Moonbase as well.
-    // This also serves as the retry delay if the request fails.
+    // store the retry delay before making the request, so that a failed
+    // request or a crashed process doesn't cause the next check
+    // to contact Moonbase immediately
     write_cache(
         &cfg.cache_path,
         &UpdateCache {
@@ -164,10 +183,12 @@ fn check_with(
 
     match fetch() {
         Ok(latest_version) => {
+            // the interval starts when the response arrives,
+            // not when this check began
             write_cache(
                 &cfg.cache_path,
                 &UpdateCache {
-                    next_check_at: now + cfg.check_interval.as_secs(),
+                    next_check_at: clock().saturating_add(cfg.check_interval.as_secs()),
                     latest_version: latest_version.clone(),
                 },
             );
@@ -181,7 +202,7 @@ fn check_with(
                 write_cache(
                     &cfg.cache_path,
                     &UpdateCache {
-                        next_check_at: now + delay.as_secs(),
+                        next_check_at: clock().saturating_add(delay.as_secs()),
                         latest_version: cached_version.clone(),
                     },
                 );
@@ -201,7 +222,7 @@ fn read_cache(path: &Path) -> Option<UpdateCache> {
 /// as it only causes another request to Moonbase.
 fn write_cache(path: &Path, cache: &UpdateCache) {
     if let Ok(contents) = serde_json::to_string(cache) {
-        _ = fs::write(path, contents);
+        _ = cache::write(path, contents);
     }
 }
 

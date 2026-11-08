@@ -1,10 +1,21 @@
 use super::*;
 use std::cell::Cell;
+use std::sync::mpsc;
+use std::thread;
 
 /// Time at which the checks in these tests run.
 const NOW: u64 = 1_000_000;
 /// Interval between successful checks in these tests.
 const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Applies the caching policy with a clock that stands still.
+fn check_with(
+    cfg: &UpdateCheckConfig,
+    now: u64,
+    fetch: impl FnOnce() -> Result<Option<String>, UpdateCheckError>,
+) -> UpdateCheck {
+    super::check_with(cfg, || now, fetch)
+}
 
 /// A config whose cache file lives in a directory removed on drop.
 struct TestCheck {
@@ -303,4 +314,90 @@ fn unwritable_cache_does_not_prevent_check() {
     let check = check_with(&test.cfg, NOW, || Ok(Some("1.3.0".to_string())));
 
     assert!(check.update_available);
+}
+
+/// Waiting instances get the completed result instead of the pre-request claim.
+#[test]
+fn simultaneous_checks_share_one_request_and_its_result() {
+    let test = TestCheck::new("concurrent");
+    test.seed(NOW, Some("1.1.0"));
+
+    let (started_send, started_recv) = mpsc::channel();
+    let (release_send, release_recv) = mpsc::channel();
+    let (result_send, result_recv) = mpsc::channel();
+
+    thread::scope(|scope| {
+        let cfg = &test.cfg;
+        let first = scope.spawn(move || {
+            check_with(cfg, NOW, || {
+                started_send.send(()).unwrap();
+                release_recv.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(Some("1.3.0".to_string()))
+            })
+        });
+
+        // the second check must wait for the request of the first one
+        started_recv.recv_timeout(Duration::from_secs(5)).unwrap();
+        let second = scope.spawn(|| {
+            result_send
+                .send(check_with(&test.cfg, NOW, no_fetch))
+                .unwrap();
+        });
+        let premature = result_recv.recv_timeout(Duration::from_millis(100));
+
+        release_send.send(()).unwrap();
+        let first = first.join().unwrap();
+        second.join().unwrap();
+
+        assert!(premature.is_err(), "a caller returned the unfinished claim");
+        let second = result_recv.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first.latest_version.as_deref(), Some("1.3.0"));
+        assert_eq!(second.latest_version, first.latest_version);
+    });
+}
+
+/// An unsuccessful shared request still installs its retry delay for waiters.
+#[test]
+fn simultaneous_failed_checks_share_the_retry_delay() {
+    let test = TestCheck::new("concurrent_failure");
+    test.seed(NOW, Some("1.1.0"));
+    let cache_guard = cache::lock(&test.cfg.cache_path).unwrap();
+
+    thread::scope(|scope| {
+        let waiter = scope.spawn(|| check_with(&test.cfg, NOW, no_fetch));
+
+        // the check holding the lock stores its retry delay and fails
+        test.seed(
+            NOW + test.cfg.failure_retry_interval.as_secs(),
+            Some("1.1.0"),
+        );
+        drop(cache_guard);
+
+        assert_eq!(
+            waiter.join().unwrap().latest_version.as_deref(),
+            Some("1.1.0")
+        );
+    });
+}
+
+/// The interval between two checks starts when the response arrives.
+#[test]
+fn successful_checks_cache_for_a_full_interval_after_the_response() {
+    let test = TestCheck::new("slow_response");
+    let time = Cell::new(NOW);
+
+    super::check_with(
+        &test.cfg,
+        || time.get(),
+        || {
+            time.set(NOW + 600);
+            Ok(Some("1.3.0".to_string()))
+        },
+    );
+
+    assert_eq!(
+        test.cache().next_check_at,
+        NOW + 600 + CHECK_INTERVAL.as_secs()
+    );
+    super::check_with(&test.cfg, || NOW + 600, no_fetch);
 }

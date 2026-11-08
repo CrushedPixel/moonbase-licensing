@@ -129,6 +129,23 @@ Moonbase API check. A locally valid non-trial offline token emits
 its follow-up URL is fetched, then `Trial(claims, url)`. Offline tokens remain valid until
 their signed expiration, if any, and only on the device whose signature they contain.
 
+## Multiple instances
+
+Several instances of your software, such as plugin instances in a DAW,
+can share a `cached_token_path`. They coordinate across threads and processes,
+so only one of them refreshes a token at a time,
+and a slow refresh or a rejection never overwrites or deletes
+a license that has been installed in the meantime.
+
+An accepted token is cached before its activation state is published,
+and the other instances pick it up within a few seconds,
+even if the instance that was activated isn't being polled.
+
+Coordination uses `.lock` and `.refresh.lock` files next to the token file,
+so its parent directory must exist and be writable.
+If it can't be used, every instance validates on its own,
+and tokens that can't be cached are reported through `error_recv`.
+
 ## Update checks
 
 `check_for_update` tells you whether a newer release of a product exists.
@@ -152,10 +169,12 @@ if check.update_available {
 }
 ```
 
-The call is blocking during the HTTP request, so make it on a background thread.
+The call is blocking during the HTTP request and while waiting for a check in another instance,
+so make it on a background thread.
 
 Moonbase only allows a limited number of anonymous requests per IP address, so results are cached in `cache_path`.
 Moonbase is contacted at most once per `check_interval`, and calling this function more often returns the cached result.
+Calls sharing a `cache_path` result in a single request, and the ones arriving while it is in flight return its result.
 A failed request is retried by the first call after an hour, or after the delay requested by Moonbase if rate limited.
 Failures are reported in `check.error` and don't affect the other fields, which then reflect the cached result.
 
