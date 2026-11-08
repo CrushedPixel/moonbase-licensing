@@ -1,3 +1,4 @@
+use crate::api::moonbase_api_base_url;
 use crate::claims::{ActivationMethod, LicenseTokenClaims};
 use crate::device_token::DeviceToken;
 use backon::{BlockingRetryable, ExponentialBuilder};
@@ -397,7 +398,7 @@ impl LicenseActivator {
 impl LicenseActivationConfig {
     /// Returns the base URL to make any Moonbase API requests to.
     fn moonbase_api_base_url(&self) -> String {
-        format!("https://{}.moonbase.sh", self.vendor_id)
+        moonbase_api_base_url(&self.vendor_id)
     }
 }
 

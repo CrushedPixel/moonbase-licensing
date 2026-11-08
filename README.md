@@ -122,6 +122,37 @@ Moonbase API check. A locally valid non-trial offline token emits
 its follow-up URL is fetched, then `Trial(claims, url)`. Offline tokens remain valid until
 their signed expiration, if any, and only on the device whose signature they contain.
 
+## Update checks
+
+`check_for_update` tells you whether a newer release of a product exists.
+It uses a public Moonbase endpoint, so it doesn't need a license and also works for free products.
+
+```rust
+use moonbase_licensing::{UpdateCheckConfig, check_for_update};
+use std::time::Duration;
+
+let check = check_for_update(&UpdateCheckConfig {
+    vendor_id: "my-vendor".to_string(),
+    product_id: "my-product".to_string(),
+    current_version: "1.0.0".to_string(),
+    cache_path: data_dir.join("update_check"),
+    check_interval: Duration::from_secs(24 * 60 * 60),
+});
+
+if check.update_available {
+    // point the user to `check.latest_version`
+}
+```
+
+The call blocks while contacting Moonbase, for 5 seconds at most, so make it on a background thread.
+
+Moonbase only allows a limited number of anonymous requests per IP address, so results are cached in `cache_path`.
+Moonbase is contacted at most once per `check_interval`, and calling this function more often returns the cached result.
+A failed request is retried by the first call after an hour, or after the delay requested by Moonbase if rate limited.
+Failures are reported in `check.error` and don't affect the other fields, which then reflect the cached result.
+
+Licensed software doesn't need this: the `product_latest_version` claim of a license token holds the same information.
+
 ## Flow
 
 Here's a rough overview of the `LicenseActivator`'s logic:
@@ -142,3 +173,8 @@ flowchart LR
     Cached -- "Purchase validated" --> Confirmed
     Cached -. "Rejected or expired" .-> Needs
 ```
+
+# Disclaimer
+
+Since version 0.4.0, development has been assisted by LLM agents.
+Code is thoroughly reviewed, as I use this library in production myself.
