@@ -20,6 +20,8 @@ Moonbase products that are free (not licensed).
 
 ### Added
 
+- `LicenseActivator::spawn_with_callback()` calls a function after each state or
+  error is published, so applications can wake their event loop instead of polling.
 - `check_for_update()` asks Moonbase for a product's latest version. It needs no
   license, so it also works for free products. Results are cached on disk and
   Moonbase is contacted at most once per `check_interval`.

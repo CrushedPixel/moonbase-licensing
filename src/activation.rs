@@ -1,6 +1,7 @@
 use crate::api::moonbase_api_base_url;
 use crate::claims::{ActivationMethod, LicenseTokenClaims};
 use crate::device_token::DeviceToken;
+use crate::notification::{NotifyingSender, notifying_channel};
 use backon::{BlockingRetryable, ExponentialBuilder};
 use chrono::{DateTime, Utc};
 use jsonwebtoken::errors::ErrorKind;
@@ -8,7 +9,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, get_current_timestamp};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread::{JoinHandle, Thread};
 use std::time::Duration;
@@ -188,6 +189,7 @@ pub struct LicenseActivationConfig {
 
 /// Performs license activation.
 pub struct LicenseActivator {
+    /// Product, device, and cache configuration for activation.
     cfg: LicenseActivationConfig,
     /// Used to serialize cache writes and conditional removal.
     cache_io: Arc<Mutex<()>>,
@@ -195,7 +197,7 @@ pub struct LicenseActivator {
     /// Receiver for activation states and any accepted token that must be cached.
     state_recv: Receiver<(ActivationState, Option<String>)>,
     /// Sender used to publish directly submitted offline activations.
-    state_send: Sender<(ActivationState, Option<String>)>,
+    state_send: NotifyingSender<(ActivationState, Option<String>)>,
     /// Whether a purchased activation has already been returned by [Self::poll].
     activation_finished: bool,
 
@@ -205,7 +207,8 @@ pub struct LicenseActivator {
     /// You may want to display only the most recent error,
     /// or perhaps display each error and make them dismissable.
     pub error_recv: Receiver<ActivationError>,
-    error_send: Sender<ActivationError>,
+    /// Sender for errors encountered while polling or submitting an offline token.
+    error_send: NotifyingSender<ActivationError>,
 
     /// While this is true, the license activator polls the Moonbase API
     /// to check if the user has activated the license online.
@@ -242,9 +245,23 @@ impl LicenseActivator {
     /// The background worker runs until a non-trial license is activated
     /// or the [LicenseActivator] is dropped.
     pub fn spawn(cfg: LicenseActivationConfig) -> Self {
-        // create communication channels to report activation state changes to calling thread
-        let (state_send, state_recv) = std::sync::mpsc::channel();
-        let (error_send, error_recv) = std::sync::mpsc::channel();
+        Self::spawn_with_callback(cfg, || {})
+    }
+
+    /// Creates an activator that notifies the caller after each state or error publication.
+    ///
+    /// The callback runs on the publishing thread, after the update has been queued.
+    /// It should schedule consumer work without blocking or panicking. Calls may arrive
+    /// before this constructor returns and while shutdown waits for the worker to finish;
+    /// the caller must revoke any host access before destroying its host context.
+    pub fn spawn_with_callback(
+        cfg: LicenseActivationConfig,
+        callback: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        // Both channels publish before invoking the same consumer notification.
+        let callback = Arc::new(callback);
+        let (state_send, state_recv) = notifying_channel(callback.clone());
+        let (error_send, error_recv) = notifying_channel(callback);
 
         // spawn worker thread
         let running = Arc::new(AtomicBool::new(true));
@@ -404,8 +421,8 @@ impl LicenseActivationConfig {
 
 fn worker_thread(
     running: Arc<AtomicBool>,
-    state_send: Sender<(ActivationState, Option<String>)>,
-    error_send: Sender<ActivationError>,
+    state_send: NotifyingSender<(ActivationState, Option<String>)>,
+    error_send: NotifyingSender<ActivationError>,
     cache_io: Arc<Mutex<()>>,
     poll_online_activation: Arc<AtomicBool>,
     cfg: LicenseActivationConfig,
@@ -635,7 +652,7 @@ fn worker_thread(
 /// Publishes an accepted activation if it wins the purchased activation race.
 fn publish_activation(
     running: &AtomicBool,
-    state_send: &Sender<(ActivationState, Option<String>)>,
+    state_send: &NotifyingSender<(ActivationState, Option<String>)>,
     state: ActivationState,
     new_token: Option<String>,
 ) -> bool {
@@ -686,7 +703,7 @@ impl From<CachedTokenError> for CachedTokenCheckFailure {
 fn report_cached_token_failure(
     cache_io: &Mutex<()>,
     cached_token_path: &Path,
-    error_send: &Sender<ActivationError>,
+    error_send: &NotifyingSender<ActivationError>,
     failure: CachedTokenCheckFailure,
 ) {
     if let Some(rejected_token) = failure.rejected_token
@@ -724,7 +741,7 @@ fn restored_activation_state(
 fn check_cached_token(
     cfg: &LicenseActivationConfig,
     running: &AtomicBool,
-    state_send: &Sender<(ActivationState, Option<String>)>,
+    state_send: &NotifyingSender<(ActivationState, Option<String>)>,
     ignore_trials: bool,
 ) -> Result<CachedTokenCheckOutcome, CachedTokenCheckFailure> {
     let mut published_cached_token = None;
@@ -1165,3 +1182,7 @@ fn moonbase_check_online_activation(
             .unwrap_or("".to_string()),
     ))
 }
+
+#[cfg(test)]
+#[path = "../tests/unit/activation_notifications.rs"]
+mod notification_tests;

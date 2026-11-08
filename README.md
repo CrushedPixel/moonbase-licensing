@@ -22,6 +22,13 @@ consuming the `LicenseActivator`'s state changes and error notifications.
 The usage is simple: spawn a `LicenseActivator`, call `poll`, and read from the `error_recv` receiver periodically,
 updating your UI and internal state in response.
 
+Use `LicenseActivator::spawn_with_callback(config, callback)` to wake your event loop
+after each state or error is queued. The value is available to receive inside the callback;
+failed sends to a dropped receiver do not invoke it. The callback runs on the publishing
+thread: the worker thread for worker results, or the caller's thread for offline token submissions.
+It may run before the constructor returns and during `drop` while the worker shuts down.
+The callback must not block or panic.
+
 ```rust
 use moonbase_licensing::{ActivationState, LicenseActivator};
 
