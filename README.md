@@ -1,4 +1,5 @@
 # moonbase-licensing
+
 [![Crates.io](https://img.shields.io/crates/v/moonbase-licensing.svg)](https://crates.io/crates/moonbase-licensing)
 [![Docs.rs](https://img.shields.io/docsrs/moonbase-licensing)](https://docs.rs/moonbase-licensing)
 
@@ -18,37 +19,52 @@ consuming the `LicenseActivator`'s state changes and error notifications.
 
 > For an example CLI using all library features, please visit [examples/cli.rs](examples/cli.rs)
 
-The usage is simple: spawn a `LicenseActivator` and read from the `state_recv` and `error_recv` receivers periodically,
+The usage is simple: spawn a `LicenseActivator`, call `poll`, and read from the `error_recv` receiver periodically,
 updating your UI and internal state in response.
 
+Use `LicenseActivator::spawn_with_callback(config, callback)` to wake your event loop
+after each state or error is queued. The value is available to receive inside the callback;
+failed sends to a dropped receiver do not invoke it. The callback runs on the publishing
+thread: the worker thread for worker results, or the caller's thread for offline token submissions.
+It may run before the constructor returns and during `drop` while the worker shuts down.
+The callback must not block or panic.
+
 ```rust
+use moonbase_licensing::{ActivationState, LicenseActivator};
+
 // on application startup, spawn the license activator:
 let config = /* ... configuration ... */;
 let mut activator = LicenseActivator::spawn(config);
 
-let mut activated = false;
-
 // then fetch status and errors regularly, for example on your UI thread:
-if !activated {
-    while let Ok(activation_state) = activator.state_recv.try_recv() {
-        match activation_state {
-            ActivationState::NeedsActivation(activation_url_browser) => {
-                // update GUI accordingly - if activation_url_browser is provided,
-                // you can direct the user to open it in the browser,
-                // if it is None, only offline activation is available at this point
-            }
-            ActivationState::Activated(claims) => {
-                // activation has been successful - you can stop fetching state updates now
-                // and store the claims (username, whether it's a trial, etc) somewhere for later use
-                activated = true;
-                break;
-            }
+if let Some(activation_state) = activator.poll() {
+    // `activation_state.grants_access()` reports whether the state
+    // grants the user access to the software, i.e. whether it isn't `NeedsActivation`
+    match activation_state {
+        ActivationState::NeedsActivation(activation_url_browser) => {
+            // revoke access if it was provisionally granted by ActivationState::Cached
+            // update GUI accordingly - if activation_url_browser is provided,
+            // you can direct the user to open it in the browser,
+            // if it is None, only offline activation is available at this point
+        }
+        ActivationState::Cached(claims) => {
+            // grant provisional access immediately and keep polling -
+            // online validation may confirm or revoke this activation
+        }
+        ActivationState::Confirmed(claims) => {
+            // activation has been confirmed - grant access and stop polling
+        }
+        ActivationState::Trial(claims, followup_online_activation_url) => {
+            // a trial activation grants access and provides the URL
+            // to install a purchased license - keep polling
         }
     }
 
-    while let Ok(error) = activator.error_recv.try_recv() {
-        // an error has been encountered - display it to the user at your discretion
-    }
+    // store claims (username, product version, etc.) as needed
+}
+
+while let Ok(error) = activator.error_recv.try_recv() {
+    // an error has been encountered - display it to the user at your discretion
 }
 
 // to write a machine file to disk for offline activation:
@@ -58,6 +74,18 @@ std::fs::write(&path, &machine_file)?;
 // to supply the offline license token obtained using the machine file:
 activator.submit_offline_activation_token(&activation_token);
 ```
+
+## Online activation polling
+
+While `poll_online_activation` is true, the license activator polls the Moonbase API
+to check if the user has activated the license online.
+
+The flag is false initially. Set it to true when the user opens the online activation URL,
+and set it to false whenever the user isn't on the online activation screen
+to avoid spamming the Moonbase API and getting rate limited.
+
+The flag is set to false automatically when a trial license is installed,
+so you must enable it again if the user opens the follow-up online activation URL.
 
 ## Online token expiration
 
@@ -71,68 +99,109 @@ There are two age thresholds to supply to `LicenseActivator` to configure these 
   are accepted without attempting online validation to log the user in instantly and preserve API quotas.
 - `online_token_expiration_threshold` is the age after which an online token is deemed expired if it can't be refreshed.
   Younger tokens are accepted even if they can't be refreshed online, to give the user the benefit of the doubt and
-  allow them to keep using the software if they have temporary connectivity issues.  
+  allow them to keep using the software if they have temporary connectivity issues.
   Be careful not to set this value too high - users may take a device offline
   and keep using the software, even if the key has been retransferred to another device in the meantime,
   thus allowing them to exceed the limit of registered devices until the threshold is exceeded.
 
+The expiration threshold is always the hard limit for accepting a token without online validation,
+even if the refresh threshold is configured to be longer.
+
 Sensible default values are 1 and 20 days, respectively.
+
+When online validation is attempted, a cached token must first pass local signature,
+product, device, and expiration checks. The activator then emits
+`Cached(claims)` immediately, so the application can grant
+provisional access without waiting for the network. Afterwards, keep polling:
+successful validation upgrades the state to `Confirmed(claims)`,
+or to `Trial(claims, url)` with an URL for follow-up online license activation.
+
+`Cached` is provisional (i.e. locally valid but not yet validated against Moonbase) and can be revoked.
+A definitive rejection from Moonbase deletes the cached token and emits `NeedsActivation` immediately.
+For any other issues validating, such as missing internet connection, we retry
+but give the user the benefit of the doubt by not revoking the token until `online_token_expiration_threshold` is reached.
 
 ## Offline token expiration
 
-Tokens created via **Offline** activation cannot be revoked,
-and are therefore valid forever unless the machine's device signature changes.
+Tokens created via **Offline** activation cannot be revoked and do not require a
+Moonbase API check. A locally valid non-trial offline token emits
+`Confirmed` immediately. An offline trial first emits `Cached` while
+its follow-up URL is fetched, then `Trial(claims, url)`. Offline tokens remain valid until
+their signed expiration, if any, and only on the device whose signature they contain.
+
+## Multiple instances
+
+Several instances of your software, such as plugin instances in a DAW,
+can share a `cached_token_path`. They coordinate across threads and processes,
+so only one of them refreshes a token at a time,
+and a slow refresh or a rejection never overwrites or deletes
+a license that has been installed in the meantime.
+
+An accepted token is cached before its activation state is published,
+and the other instances pick it up within a few seconds,
+even if the instance that was activated isn't being polled.
+
+Coordination uses `.lock` and `.refresh.lock` files next to the token file,
+so its parent directory must exist and be writable.
+If it can't be used, every instance validates on its own,
+and tokens that can't be cached are reported through `error_recv`.
+
+## Update checks
+
+`check_for_update` tells you whether a newer release of a product exists.
+It uses a public Moonbase endpoint, so it doesn't need a license and also works for free products.
+
+```rust
+use moonbase_licensing::{UpdateCheckConfig, check_for_update};
+use std::time::Duration;
+
+let check = check_for_update(&UpdateCheckConfig {
+    vendor_id: "my-vendor".to_string(),
+    product_id: "my-product".to_string(),
+    current_version: "1.0.0".to_string(),
+    cache_path: data_dir.join("update_check"),
+    check_interval: Duration::from_hours(24),
+    failure_retry_interval: Duration::from_hours(1),
+});
+
+if check.update_available {
+    // point the user to `check.latest_version`
+}
+```
+
+The call is blocking during the HTTP request and while waiting for a check in another instance,
+so make it on a background thread.
+
+Moonbase only allows a limited number of anonymous requests per IP address, so results are cached in `cache_path`.
+Moonbase is contacted at most once per `check_interval`, and calling this function more often returns the cached result.
+Calls sharing a `cache_path` result in a single request, and the ones arriving while it is in flight return its result.
+A failed request is retried by the first call after an hour, or after the delay requested by Moonbase if rate limited.
+Failures are reported in `check.error` and don't affect the other fields, which then reflect the cached result.
+
+Licensed software doesn't need this: the `product_latest_version` claim of a license token holds the same information.
 
 ## Flow
 
 Here's a rough overview of the `LicenseActivator`'s logic:
 
 ```mermaid
----
-config:
-  layout: dagre
----
-flowchart TD
- subgraph CacheFlow["Cached Token Flow"]
-        C{"Cached token exists?"}
-        V{"Younger than refresh threshold?"}
-        Activated1["Activated (from cache)"]
-        R{"Refresh successful?"}
-        Activated2["Activated (refreshed)"]
-        NeedsAct["Needs Activation"]
-  end
- subgraph OfflineFlow["Offline Activation"]
-        Offline["User provides offline token"]
-        Activated3["Activated (offline)"]
-        Err1["Error: Offline token invalid"]
-  end
- subgraph OnlineFlow["Online Activation"]
-        Online["Request online activation URL"]
-        URL["User opens browser"]
-        Poll{"Token active online?"}
-        Activated4["Activated (online)"]
-        Wait["Keep polling..."]
-  end
-    C -- Yes --> V
-    V -- Yes --> Activated1
-    V -- No --> R
-    R -- Yes --> Activated2
-    R -- No --> NeedsAct
-    C -- No --> NeedsAct
-    NeedsAct --> Offline & Online
-    Offline -- Valid --> Activated3
-    Offline -- Invalid --> Err1
-    Online --> URL
-    URL --> Poll
-    Poll -- Yes --> Activated4
-    Poll -- No --> Wait
-    Wait --> Poll
-    Start(["Start Activation"]) --> C
-     Activated1:::state
-     Activated2:::state
-     Activated3:::state
-     Err1:::err
-     Activated4:::state
-    classDef state fill:#eef,stroke:#88f,color:#003
-    classDef err fill:#fee,stroke:#f88,color:#700
+flowchart LR
+    Start([Start]) --> Check{Check cached token}
+
+    Check -- "None or invalid" --> Needs[NeedsActivation]
+    Check -- Provisional --> Cached[Cached]
+    Check -- Confirmed --> Confirmed[Confirmed]
+
+    Needs -- "Trial accepted" --> Cached
+    Cached -- "Trial URL ready" --> Trial[Trial]
+    Trial -- Purchased --> Confirmed
+
+    Needs -- Purchased --> Confirmed
+    Cached -- "Purchase validated" --> Confirmed
+    Cached -. "Rejected or expired" .-> Needs
 ```
+
+# Disclaimer
+
+Since version 0.4.0, development has been assisted by LLM agents.
+All code is thoroughly reviewed, as I use this library in production myself.

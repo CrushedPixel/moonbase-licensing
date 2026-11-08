@@ -1,7 +1,8 @@
 [package]
 name = "moonbase-licensing"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 categories = ["api-bindings"]
 description = "Client for moonbase.sh licensing system"
@@ -11,8 +12,10 @@ backon = "1.5.2"
 base64 = "0.22.1"
 chrono = { version = "0.4.41", features = ["serde"] }
 jsonwebtoken = "9.3.1"
+semver = "1.0.28"
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.143"
+tempfile = "3.21.0"
 thiserror = "2.0.16"
 ureq = { version = "3.1.0", features = ["json"] }
 
