@@ -31,6 +31,7 @@ impl TestCheck {
                 current_version: "1.0.0".to_string(),
                 cache_path: dir.join("update_check"),
                 check_interval: CHECK_INTERVAL,
+                failure_retry_interval: Duration::from_secs(20 * 60),
             },
             dir,
         }
@@ -144,7 +145,10 @@ fn due_check_claims_cache_before_fetching() {
 
     check_with(&test.cfg, NOW, || {
         let cache = test.cache();
-        assert_eq!(cache.next_check_at, NOW + RETRY_INTERVAL.as_secs());
+        assert_eq!(
+            cache.next_check_at,
+            NOW + test.cfg.failure_retry_interval.as_secs()
+        );
         assert_eq!(cache.latest_version.as_deref(), Some("1.2.0"));
         fetched.set(true);
         Ok(Some("1.3.0".to_string()))
@@ -197,10 +201,11 @@ fn product_without_release_is_not_an_update() {
     assert_eq!(test.cache().next_check_at, NOW + CHECK_INTERVAL.as_secs());
 }
 
-/// A failed request reports the error along with the cached version.
+/// A failed request keeps the cached version and waits the configured retry interval.
 #[test]
 fn failed_fetch_keeps_cached_version() {
-    let test = TestCheck::new("failure");
+    let mut test = TestCheck::new("failure");
+    test.cfg.failure_retry_interval = Duration::from_secs(2 * 60 * 60);
     test.seed(NOW, Some("1.2.0"));
 
     let check = check_with(&test.cfg, NOW, failing_fetch);
@@ -210,8 +215,18 @@ fn failed_fetch_keeps_cached_version() {
     assert!(check.error.is_some());
 
     let cache = test.cache();
-    assert_eq!(cache.next_check_at, NOW + RETRY_INTERVAL.as_secs());
+    assert_eq!(
+        cache.next_check_at,
+        NOW + test.cfg.failure_retry_interval.as_secs()
+    );
     assert_eq!(cache.latest_version.as_deref(), Some("1.2.0"));
+
+    check_with(&test.cfg, cache.next_check_at - 1, no_fetch);
+    let retried = check_with(&test.cfg, cache.next_check_at, || {
+        Ok(Some("1.3.0".to_string()))
+    });
+    assert_eq!(retried.latest_version.as_deref(), Some("1.3.0"));
+    assert!(retried.error.is_none());
 }
 
 /// The delay requested by Moonbase is honored.
@@ -244,14 +259,17 @@ fn rate_limit_delay_is_capped_at_check_interval() {
     assert_eq!(test.cache().next_check_at, NOW + CHECK_INTERVAL.as_secs());
 }
 
-/// A delay given as an HTTP date falls back to the retry delay.
+/// A rate limit without a usable delay falls back to the configured retry interval.
 #[test]
 fn rate_limit_without_delay_uses_retry_interval() {
     let test = TestCheck::new("rate_limit_date");
 
     check_with(&test.cfg, NOW, || Err(UpdateCheckError::RateLimited(None)));
 
-    assert_eq!(test.cache().next_check_at, NOW + RETRY_INTERVAL.as_secs());
+    assert_eq!(
+        test.cache().next_check_at,
+        NOW + test.cfg.failure_retry_interval.as_secs()
+    );
 }
 
 /// A next check further away than one interval is not honored.

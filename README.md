@@ -143,7 +143,8 @@ let check = check_for_update(&UpdateCheckConfig {
     product_id: "my-product".to_string(),
     current_version: "1.0.0".to_string(),
     cache_path: data_dir.join("update_check"),
-    check_interval: Duration::from_secs(24 * 60 * 60),
+    check_interval: Duration::from_hours(24),
+    failure_retry_interval: Duration::from_hours(1),
 });
 
 if check.update_available {

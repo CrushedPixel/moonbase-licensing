@@ -10,9 +10,6 @@ use thiserror::Error;
 use ureq::http::header::RETRY_AFTER;
 use ureq::http::StatusCode;
 
-/// Delay before another check may run after one has started or failed.
-const RETRY_INTERVAL: Duration = Duration::from_hours(1);
-
 /// Configures an update check for one product.
 #[derive(Clone, Debug)]
 pub struct UpdateCheckConfig {
@@ -25,8 +22,10 @@ pub struct UpdateCheckConfig {
     /// The file used to remember the latest version and the next check time.
     /// Its parent directory must exist for the cache to take effect.
     pub cache_path: PathBuf,
-    /// The minimum time between two successful requests to Moonbase.
+    /// The minimum time between two successful requests.
     pub check_interval: Duration,
+    /// The delay before retrying a failed request.
+    pub failure_retry_interval: Duration,
 }
 
 /// The outcome of [check_for_update].
@@ -122,10 +121,11 @@ pub fn is_newer_version(current_version: &str, latest_version: &str) -> bool {
 ///
 /// Results are cached in `cache_path`, and Moonbase is only contacted once
 /// `check_interval` has passed since the last successful request.
-/// Failed requests are not retried immediately. The first call after a delay
-/// makes a new attempt, honoring the delay requested by Moonbase if rate limited.
+/// Failed requests are retried by the first call after `failure_retry_interval`,
+/// honoring the delay requested by Moonbase if rate limited.
+/// Retry delays are capped at `check_interval`.
 ///
-/// This call blocks for a few seconds at most when contacting Moonbase,
+/// This call blocks while contacting Moonbase,
 /// so it should not be made on a UI thread.
 pub fn check_for_update(cfg: &UpdateCheckConfig) -> UpdateCheck {
     let now = SystemTime::now()
@@ -149,7 +149,7 @@ fn check_with(
     }
 
     let cached_version = cache.and_then(|cache| cache.latest_version);
-    let retry_interval = RETRY_INTERVAL.min(cfg.check_interval);
+    let failure_retry_interval = cfg.failure_retry_interval.min(cfg.check_interval);
 
     // Claim this check before making the request, so that other instances
     // starting at the same time don't contact Moonbase as well.
@@ -157,7 +157,7 @@ fn check_with(
     write_cache(
         &cfg.cache_path,
         &UpdateCache {
-            next_check_at: now + retry_interval.as_secs(),
+            next_check_at: now + failure_retry_interval.as_secs(),
             latest_version: cached_version.clone(),
         },
     );
@@ -176,7 +176,7 @@ fn check_with(
         Err(error) => {
             if let UpdateCheckError::RateLimited(retry_after) = &error {
                 let delay = retry_after
-                    .unwrap_or(retry_interval)
+                    .unwrap_or(failure_retry_interval)
                     .min(cfg.check_interval);
                 write_cache(
                     &cfg.cache_path,
