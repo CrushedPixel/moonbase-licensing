@@ -1,4 +1,4 @@
-use crate::api::moonbase_api_base_url;
+use crate::api::{moonbase_agent, moonbase_api_base_url};
 use crate::claims::{ActivationMethod, LicenseTokenClaims};
 use crate::device_token::DeviceToken;
 use crate::notification::{NotifyingSender, notifying_channel};
@@ -1015,17 +1015,17 @@ fn moonbase_refresh_token(
     cfg: &LicenseActivationConfig,
     token: &str,
 ) -> Result<TokenValidationResponse, MoonbaseApiError> {
-    let response = ureq::post(format!(
-        "{}/api/client/licenses/{}/validate",
-        cfg.moonbase_api_base_url(),
-        cfg.product_id
-    ))
-    .config()
-    .http_status_as_error(false)
-    .timeout_global(Some(Duration::from_secs(10)))
-    .build()
-    .content_type("text/plain")
-    .send(token)?;
+    let response = moonbase_agent()
+        .post(format!(
+            "{}/api/client/licenses/{}/validate",
+            cfg.moonbase_api_base_url(),
+            cfg.product_id
+        ))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .content_type("text/plain")
+        .send(token)?;
 
     let status = response.status();
 
@@ -1102,18 +1102,16 @@ struct ActivationUrls {
 fn moonbase_request_online_activation(
     cfg: &LicenseActivationConfig,
 ) -> Result<ActivationUrls, MoonbaseApiError> {
-    let response = ureq::post(format!(
-        "{}/api/client/activations/{}/request",
-        cfg.moonbase_api_base_url(),
-        cfg.product_id
-    ))
-    .config()
-    .timeout_global(Some(Duration::from_secs(10)))
-    .build()
-    .send_json(ActivationUrlsRequestPayload {
-        device_name: cfg.device_name.clone(),
-        device_signature: cfg.device_signature.clone(),
-    })?;
+    let response = moonbase_agent()
+        .post(format!(
+            "{}/api/client/activations/{}/request",
+            cfg.moonbase_api_base_url(),
+            cfg.product_id
+        ))
+        .send_json(ActivationUrlsRequestPayload {
+            device_name: cfg.device_name.clone(),
+            device_signature: cfg.device_signature.clone(),
+        })?;
 
     let status = response.status();
     if status == StatusCode::OK {
@@ -1148,11 +1146,7 @@ fn moonbase_check_online_activation(
     cfg: &LicenseActivationConfig,
     url: &str,
 ) -> Result<Option<(String, LicenseTokenClaims)>, MoonbaseApiError> {
-    let response = ureq::get(url)
-        .config()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .build()
-        .call()?;
+    let response = moonbase_agent().get(url).call()?;
 
     let status = response.status();
 

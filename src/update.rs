@@ -1,20 +1,17 @@
 //! Checks Moonbase for newer product releases without requiring a license.
 
-use crate::api::moonbase_api_base_url;
+use crate::api::{moonbase_agent, moonbase_api_base_url};
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
-use ureq::http::StatusCode;
 use ureq::http::header::RETRY_AFTER;
+use ureq::http::StatusCode;
 
 /// Delay before another check may run after one has started or failed.
-const RETRY_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-/// Upper bound for one Moonbase request from start to finish.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const RETRY_INTERVAL: Duration = Duration::from_hours(1);
 
 /// Configures an update check for one product.
 #[derive(Clone, Debug)]
@@ -212,16 +209,16 @@ fn write_cache(path: &Path, cache: &UpdateCache) {
 ///
 /// This endpoint is public, so no license or API key is involved.
 fn fetch_latest_version(cfg: &UpdateCheckConfig) -> Result<Option<String>, UpdateCheckError> {
-    let response = ureq::get(format!(
-        "{}/api/customer/inventory/products/{}",
-        moonbase_api_base_url(&cfg.vendor_id),
-        cfg.product_id
-    ))
-    .config()
-    .http_status_as_error(false)
-    .timeout_global(Some(REQUEST_TIMEOUT))
-    .build()
-    .call()?;
+    let response = moonbase_agent()
+        .get(format!(
+            "{}/api/customer/inventory/products/{}",
+            moonbase_api_base_url(&cfg.vendor_id),
+            cfg.product_id
+        ))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()?;
 
     let status = response.status();
 

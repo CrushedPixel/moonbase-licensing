@@ -151,7 +151,7 @@ if check.update_available {
 }
 ```
 
-The call blocks while contacting Moonbase, for 5 seconds at most, so make it on a background thread.
+The call is blocking during the HTTP request, so make it on a background thread.
 
 Moonbase only allows a limited number of anonymous requests per IP address, so results are cached in `cache_path`.
 Moonbase is contacted at most once per `check_interval`, and calling this function more often returns the cached result.
@@ -184,4 +184,4 @@ flowchart LR
 # Disclaimer
 
 Since version 0.4.0, development has been assisted by LLM agents.
-Code is thoroughly reviewed, as I use this library in production myself.
+All code is thoroughly reviewed, as I use this library in production myself.
